@@ -28,6 +28,43 @@
    - [Build and run the Fastify app](#build-and-run-the-fastify-app)
    - [Why host 0.0.0.0?](#why-host-0000)
    - [App 1 and App 2 compared](#app-1-and-app-2-compared)
+5. [App 3: alpine-linux](#app-3-alpine-linux)
+   - [What is Alpine Linux?](#what-is-alpine-linux)
+   - [Alpine and Debian compared](#alpine-and-debian-compared)
+   - [Benefits of Alpine](#benefits-of-alpine)
+   - [Things that work differently on Alpine](#things-that-work-differently-on-alpine)
+   - [When to use Alpine, slim or the full image](#when-to-use-alpine-slim-or-the-full-image)
+   - [Build and run the Alpine app](#build-and-run-the-alpine-app)
+   - [Version 2: install Node.js on plain Alpine](#version-2-install-nodejs-on-plain-alpine)
+   - [Version 1 and Version 2 compared](#version-1-and-version-2-compared)
+   - [Which version to use](#which-version-to-use)
+6. [App 4: multi-stage-builds](#app-4-multi-stage-builds)
+   - [What is a multi-stage build?](#what-is-a-multi-stage-build)
+   - [How this Dockerfile works](#how-this-dockerfile-works-1)
+   - [What ends up in the final image](#what-ends-up-in-the-final-image)
+   - [Build and run the multi-stage app](#build-and-run-the-multi-stage-app)
+   - [Single-stage and multi-stage compared](#single-stage-and-multi-stage-compared)
+   - [Watch out: native modules](#watch-out-native-modules)
+   - [Making it smaller and simpler](#making-it-smaller-and-simpler)
+   - [When to use multi-stage builds](#when-to-use-multi-stage-builds)
+7. [App 5: distroless](#app-5-distroless)
+   - [What is distroless?](#what-is-distroless)
+   - [How the distroless Dockerfile works](#how-the-distroless-dockerfile-works)
+   - [Build and run the distroless app](#build-and-run-the-distroless-app)
+   - [Living without a shell](#living-without-a-shell)
+   - [Problem 1: the app runs as root](#problem-1-the-app-runs-as-root)
+   - [Problem 2: no .dockerignore](#problem-2-no-dockerignore)
+   - [Distroless compared with the other apps](#distroless-compared-with-the-other-apps)
+   - [When to use distroless](#when-to-use-distroless)
+8. [App 6: static-asset-project](#app-6-static-asset-project)
+   - [The app: an Astro website](#the-app-an-astro-website)
+   - [How the static site Dockerfile works](#how-the-static-site-dockerfile-works)
+   - [What is nginx?](#what-is-nginx)
+   - [Build and run the static site](#build-and-run-the-static-site)
+   - [What is inside the final image](#what-is-inside-the-final-image)
+   - [Your Dockerfile and solution.Dockerfile](#your-dockerfile-and-solutiondockerfile)
+   - [Improving the static site build](#improving-the-static-site-build)
+   - [When to serve static files with nginx](#when-to-serve-static-files-with-nginx)
 
 ---
 
@@ -42,15 +79,40 @@ my_project/
 ├── build-a-nodejs-app/                  # App 1: web server with no dependencies
 │   ├── Dockerfile
 │   └── index.js
-└── build-a-more-complicated-nodejs-app/ # App 2: Fastify server with npm dependencies
-    ├── .dockerignore
+├── build-a-more-complicated-nodejs-app/ # App 2: Fastify server with npm dependencies
+│   ├── .dockerignore
+│   ├── Dockerfile
+│   ├── index.js
+│   ├── package.json
+│   └── package-lock.json
+├── alpine-linux/                        # App 3: App 2 on a small Alpine Linux base image
+│   ├── .dockerignore
+│   ├── Dockerfile
+│   ├── index.js
+│   ├── package.json
+│   └── package-lock.json
+├── multi-stage-builds/                  # App 4: install on Debian, run on Alpine
+│   ├── .dockerignore
+│   ├── Dockerfile
+│   ├── index.js
+│   ├── package.json
+│   └── package-lock.json
+├── distroless/                          # App 5: install on Debian, run on distroless
+│   ├── Dockerfile
+│   ├── index.js
+│   ├── package.json
+│   └── package-lock.json
+└── static-asset-project/                # App 6: build a website with Node.js, serve it with nginx
     ├── Dockerfile
-    ├── index.js
+    ├── solution.Dockerfile
+    ├── astro.config.mjs, tailwind.config.mjs, tsconfig.json
     ├── package.json
-    └── package-lock.json
+    ├── package-lock.json
+    ├── public/                          # files copied as they are (favicon.svg)
+    └── src/                             # pages, layouts and components
 ```
 
-`node_modules/` is not committed (see `.gitignore`). In App 2, the image installs its own copy during the build.
+`node_modules/` is not committed (see `.gitignore`). In App 2 to App 5, the image installs its own copy during the build.
 
 ---
 
@@ -105,6 +167,7 @@ Use `-it` when you want to type into the container. `-i` alone has no prompt, an
 ```sh
 docker run -it node:20          # opens the Node.js REPL
 docker run -it node:20 bash     # opens a bash shell instead of the default command
+docker run -it node:20-alpine sh  # Alpine images have no bash, so use sh
 ```
 
 Type `exit` (or press `Ctrl+D`) to leave. The container stops when you exit.
@@ -181,7 +244,17 @@ Things you can see in this output:
 - **Everything runs as `lolcat`**, not `root`. See [Running as a non-root user](#running-as-a-non-root-user). In App 2, this column says `node`.
 - The container runs very few processes, only the ones it needs. The `ps aux` line is the command you just ran.
 
-`docker top na` shows the same list from outside the container. It works even when the image has no `ps` command; small images such as `node:20-slim` or `alpine` variants may not include it.
+`docker top na` shows the same list from outside the container. It works even when the image has no `ps` command, as in `node:20-slim`, or no shell at all, as in [distroless](#app-5-distroless).
+
+On Alpine images, `ps` is the small BusyBox version. It ignores `aux` and always shows only four columns:
+
+```
+PID   USER     TIME  COMMAND
+    1 node      0:00 /sbin/docker-init -- docker-entrypoint.sh node index.js
+    8 node      0:00 node index.js
+```
+
+See [App 3: alpine-linux](#app-3-alpine-linux).
 
 ### Cleaning up
 
@@ -367,7 +440,7 @@ The order matters:
 
 Each user has a number (UID). The `node` user already has UID `1000`, so `lolcat` gets the next free one, `1001`.
 
-**Note:** `useradd` is for Debian and Ubuntu based images like `node:20`. Alpine images (`node:20-alpine`) use `adduser` instead.
+**Note:** `useradd` is for Debian and Ubuntu based images like `node:20`. Alpine images (`node:20-alpine`) do not have it (`useradd: not found`). Use `adduser` instead: `RUN adduser -D lolcat` creates `lolcat` with the home folder `/home/lolcat` and no password (`-D`). Its default shell is `/bin/sh`, because Alpine has no bash. See [App 3: alpine-linux](#app-3-alpine-linux).
 
 #### Check which user runs the app
 
@@ -659,3 +732,778 @@ App 1 did not need this, because Node's `http` `.listen(3000)` listens on all ad
 | Port | `3000` | `8080`, on host `0.0.0.0` |
 | Reply | `omg hi` (text) | `{"hello":"world"}` (JSON) |
 | Logs | Plain text with `console.log` | JSON lines from Fastify's logger |
+
+---
+
+## App 3: alpine-linux
+
+This app, in the `alpine-linux/` folder, runs App 2 on Alpine Linux. It has two versions:
+
+- **Version 1** (this section, up to [Build and run the Alpine app](#build-and-run-the-alpine-app)): App 2 with **one** change, the base image `node:20-alpine`.
+- **Version 2** (the current `Dockerfile` in the folder): starts from plain `alpine:3.19` and installs Node.js itself. See [Version 2: install Node.js on plain Alpine](#version-2-install-nodejs-on-plain-alpine).
+
+Version 1:
+
+```dockerfile
+FROM node:20-alpine
+
+USER node
+
+WORKDIR /home/node/code
+
+COPY --chown=node package*.json ./
+
+RUN npm ci
+
+COPY --chown=node . .
+
+CMD [ "node", "index.js"]
+```
+
+`index.js`, `package.json`, `package-lock.json` and `.dockerignore` are the same as in App 2 (only the `name` field differs), so everything in [App 2](#app-2-build-a-more-complicated-nodejs-app) applies here too. The `node` user also exists in the Alpine image, with the same UID (`1000`), so `USER node` and `--chown=node` work without changes.
+
+### What is Alpine Linux?
+
+Every image is built on a Linux distribution. `node:20` is built on **Debian** (version 12, "bookworm"). `node:20-alpine` is built on **Alpine Linux**, a distribution made to be as small and simple as possible. Alpine is built from three small parts:
+
+- **musl** instead of glibc, as the C library: the low-level code that almost every program, including Node.js, uses to talk to the system.
+- **BusyBox** instead of the GNU tools: one small program that provides `sh`, `ls`, `ps`, `cp` and most other basic commands.
+- **apk** instead of `apt-get`, as the package manager.
+
+The Node.js version is the same in both. In these images, both run Node.js `v20.20.2`.
+
+### Alpine and Debian compared
+
+Measured on this project:
+
+| | `node:20` (Debian) | `node:20-slim` (Debian) | `node:20-alpine` (Alpine) |
+| --- | --- | --- | --- |
+| Base image size | 1.1 GB | 222 MB | **136 MB** |
+| This app's image size | 1.11 GB (App 2) | | **146 MB** (App 3) |
+| Installed OS packages | 413 | | 18 |
+| C library | glibc | glibc | musl |
+| Shell | `bash` (and `sh`) | `bash` (and `sh`) | `sh` only (no `bash`) |
+| Package manager | `apt-get` | `apt-get` | `apk` |
+| Add a user | `useradd` | `useradd` | `adduser` |
+| Extra tools included | `git`, `curl`, `python3`, `make`, `gcc` and more | Almost none, not even `ps` | Almost none (`wget`, BusyBox tools) |
+| Memory used by the running app | about 21 MiB | | about 20 MiB |
+
+The app itself, its dependencies and Fastify add only about 10 MB in both cases. The difference is almost all in the base image.
+
+`node:20-slim` is a third option: Debian (glibc, `apt-get`, `bash`), but with most extra packages removed.
+
+### Benefits of Alpine
+
+- **Much smaller images.** 146 MB instead of 1.11 GB, about 8 times smaller. They use less disk space on your machine and on servers.
+- **Faster pulls and pushes.** Uploading to a registry and downloading on a server or in CI takes much less time. This matters when you deploy often or start containers on many machines.
+- **Smaller attack surface.** 18 packages instead of 413. Fewer programs mean fewer possible security holes, and fewer warnings when you scan the image with a security scanner (for example `docker scout cves`).
+- **Fewer tools for an attacker.** If someone breaks into the container, there is no `bash`, `git`, `curl` or compiler to help them.
+- **Nothing else changes for this app.** Fastify is plain JavaScript, so it runs on Alpine without changes.
+
+Alpine does **not** make the app faster or use less memory: the running app used about 20 MiB in both images. The benefit is the size of the image, not the speed of the app.
+
+### Things that work differently on Alpine
+
+- **No `bash`.** `docker exec -it fa bash` fails. Use `sh` instead: `docker exec -it fa sh`. If you need bash, install it with `RUN apk add --no-cache bash` (as `root`, before `USER`).
+- **No `useradd`.** Use `adduser -D <name>`. See the note in [Create your own user](#create-your-own-user-this-dockerfile).
+- **`apk` instead of `apt-get`.** For example, `RUN apk add --no-cache curl` instead of `RUN apt-get update && apt-get install -y curl`. `--no-cache` stops apk from keeping its package list in the image.
+- **BusyBox commands have fewer options.** For example, `ps aux` shows only `PID`, `USER`, `TIME` and `COMMAND`. See [ps aux](#processes-inside-a-container-ps-aux).
+- **musl instead of glibc.** This only matters for npm packages with **native code** (C or C++ compiled for the system, such as `bcrypt`, `sharp` or some database drivers):
+  - If the package ships a ready-made build for musl, it works.
+  - If it does not, `npm ci` has to compile it, and Alpine has no compiler. You need `RUN apk add --no-cache python3 make g++` first, which makes the build slower and the image bigger.
+  - Some programs exist only for glibc and do not run on Alpine at all, for example the Chrome that Puppeteer downloads.
+- **Small behaviour differences.** musl handles some things, like DNS lookups and memory allocation, a little differently from glibc. It rarely matters, but it can cause hard-to-find bugs that only happen on Alpine.
+
+### When to use Alpine, slim or the full image
+
+**Use Alpine (`node:20-alpine`) when:**
+
+- Your dependencies are plain JavaScript, or all have musl builds, like this Fastify app.
+- You build images for production, CI or deployments, where size and pull time matter.
+- You want the smallest attack surface.
+
+**Use slim (`node:20-slim`) when:**
+
+- You want a small image, but a dependency needs glibc or does not work on Alpine.
+- You want Debian's `apt-get` and `bash`, with most of the size savings.
+
+**Use the full image (`node:20`) when:**
+
+- You are learning or debugging and want tools like `git`, `curl`, `bash` and `ps` ready to use.
+- `npm ci` needs to compile native modules, and you do not want to install build tools yourself.
+- Image size does not matter, for example for a quick local experiment.
+
+A common setup is to start with `node:20` while developing, then switch to `node:20-alpine` (or `node:20-slim` if something breaks) for the image you deploy. Always run and test the app on the same base image you deploy with.
+
+### Build and run the Alpine app
+
+```sh
+cd alpine-linux
+docker build . -t my-fastify-app:alpine
+docker run --init --publish 8080:8080 --rm --name fa my-fastify-app:alpine
+```
+
+The tag `alpine` keeps it apart from the Debian build of the same app. Compare the two sizes with:
+
+```sh
+docker image ls my-fastify-app
+```
+
+The app works exactly like App 2: <http://localhost:8080> returns `{"hello":"world"}`, and the logs are the same JSON lines. For a shell inside the container, use `sh`:
+
+```sh
+docker exec -it fa sh
+```
+
+**Note:** These commands build whatever `Dockerfile` is in the folder, and that is now Version 2.
+
+### Version 2: install Node.js on plain Alpine
+
+Version 2 does not use a ready-made Node.js image. It starts from plain Alpine Linux and installs Node.js and npm with `apk`:
+
+```dockerfile
+FROM alpine:3.19
+
+RUN apk add --update nodejs npm
+
+RUN addgroup -S node && adduser -S node -G node
+
+USER node
+
+WORKDIR /home/node/code
+
+COPY --chown=node package*.json ./
+
+RUN npm ci
+
+COPY --chown=node . .
+
+CMD [ "node", "index.js"]
+```
+
+Only the first three instructions are new. From `USER node` down, it is the same as Version 1 and App 2.
+
+#### How the new lines work
+
+- `FROM alpine:3.19` uses the official Alpine Linux image, version 3.19. It is only **7.7 MB** and has no Node.js, npm or `node` user.
+- `RUN apk add --update nodejs npm` installs Node.js and npm from Alpine's own package repository:
+  - `--update` downloads the latest package list first, so apk knows which versions are available.
+  - `nodejs` and `npm` are two separate packages in Alpine, so you need both. Without `npm`, `RUN npm ci` fails.
+  - The version is the one Alpine 3.19 ships: Node.js **v20.15.1** and npm **10.2.5**. You cannot pick another patch version.
+  - apk installs a few more packages that Node.js needs (for example ICU for languages and dates, and OpenSSL), so the image has 27 packages instead of 18.
+- `RUN addgroup -S node && adduser -S node -G node` creates the `node` user, because plain Alpine does not have it:
+  - `addgroup -S node` creates a **system** group called `node`.
+  - `adduser -S node` creates a **system** user called `node`: it has no password, its login shell is `/sbin/nologin` (nobody can log in as it), and its home folder is `/home/node`. System users get a low UID, here `100`, instead of `1000`.
+  - `-G node` puts the user in the `node` group.
+  - `&&` runs the second command only if the first one succeeds. Both are in one `RUN`, so they make one layer.
+
+`node` is just a name here. It matches the user in the official images, so the rest of the Dockerfile works without changes.
+
+#### Things that are different in Version 2
+
+- **No `docker-entrypoint.sh`.** Plain Alpine has no `ENTRYPOINT`, so Docker runs the `CMD` directly. `ps aux` shows `/sbin/docker-init -- node index.js` instead of `/sbin/docker-init -- docker-entrypoint.sh node index.js`.
+- **Different user IDs.** `id` shows `uid=100(node) gid=101(node)`, not `1000`. This matters when you share files between your machine and the container (for example with `--volume`), because file permissions use the number, not the name.
+- **apk's package list stays in the image.** `--update` saves the downloaded list in `/var/cache/apk` (2.1 MB here). Use `--no-cache` instead: it downloads the list, installs and leaves nothing behind:
+
+  ```dockerfile
+  RUN apk add --no-cache nodejs npm
+  ```
+
+### Version 1 and Version 2 compared
+
+Measured on this project:
+
+| | Version 1: `node:20-alpine` | Version 2: `alpine:3.19` + apk |
+| --- | --- | --- |
+| Base image size | 136 MB | 7.7 MB (before Node.js is installed) |
+| This app's image size | 146 MB | **82.4 MB** |
+| Node.js version | v20.20.2 | v20.15.1 |
+| npm version | 10.8.2 | 10.2.5 |
+| Who builds Node.js | The Node.js Docker team | The Alpine Linux team |
+| Choosing the Node.js version | Any version, by tag (`node:20.20.2-alpine`, `node:22-alpine`, ...) | Only the version the Alpine release ships |
+| Installed packages | 18 | 27 |
+| `node` user | Built in, UID `1000`, shell `/bin/sh` | Created by you, UID `100`, shell `/sbin/nologin` |
+| `ENTRYPOINT` | `docker-entrypoint.sh` | None |
+| Lines in the Dockerfile | 7 instructions | 9 instructions |
+| Memory used by the running app | about 20 MiB | about 20 MiB |
+
+Both versions return `{"hello":"world"}` and log the same JSON lines.
+
+**Why is Version 2 smaller?** The official image includes extra tools such as `yarn`, and Node.js is built to carry its own copies of some libraries. Alpine's `nodejs` package uses the libraries shared by the whole system instead, and has nothing extra.
+
+### Which version to use
+
+**Version 2 benefits:**
+
+- **Smallest image.** 82.4 MB instead of 146 MB, about 44% smaller, and about 13 times smaller than the Debian App 2 (1.11 GB).
+- **You control everything.** Every package in the image is one you asked for.
+- **The same pattern works for any app.** You can install Python, Go or anything else from apk the same way, on the same base image.
+
+**Version 2 drawbacks:**
+
+- **Older Node.js, chosen by Alpine.** You get the version Alpine 3.19 ships (v20.15.1), not the newest v20 release (v20.20.2). The newer releases include security fixes, and you cannot upgrade without changing the Alpine version.
+- **Alpine 3.19 is out of support.** Its security updates ended in November 2025, so its packages, including Node.js, no longer get fixes. Use a supported Alpine release, and check which Node.js version its `nodejs` package has at [pkgs.alpinelinux.org](https://pkgs.alpinelinux.org/packages?name=nodejs).
+- **More to maintain.** You write and look after the install and user lines that the official image already does for you.
+- **Different from the official image.** The UID (`100`, not `1000`) and the missing `ENTRYPOINT` can surprise people who know the official `node` images.
+
+**Use Version 1 (`node:20-alpine`) when** you want an exact Node.js version, regular security updates from the Node.js team and the least work. This is the right choice for most projects.
+
+**Use Version 2 (`alpine` + `apk`) when** image size matters most, the Node.js version from Alpine is good enough for you, and you keep the Alpine version up to date. It is also a good way to learn what the official image does for you.
+
+Build Version 2 with its own tag, so you can compare it with Version 1:
+
+```sh
+cd alpine-linux
+docker build . -t my-fastify-app:alpine-apk
+docker image ls my-fastify-app
+```
+
+---
+
+## App 4: multi-stage-builds
+
+This app, in the `multi-stage-builds/` folder, runs the same Fastify app as App 2 and App 3. `index.js`, `package.json`, `package-lock.json` and `.dockerignore` are the same (only the `name` field differs). The difference is the `Dockerfile`: it builds the app in **two stages**.
+
+```dockerfile
+# build step
+FROM node:20 AS node-builder
+RUN mkdir /build
+WORKDIR /build
+COPY package*.json ./
+RUN npm ci
+COPY . .
+
+#production step
+FROM alpine:3.19
+RUN apk add --update nodejs npm
+RUN addgroup -S node && adduser -S node -G node
+USER node
+RUN mkdir /home/node/code
+WORKDIR /home/node/code
+COPY --from=node-builder --chown=node:node /build .
+CMD ["node", "index.js"]
+```
+
+### What is a multi-stage build?
+
+A Dockerfile can have more than one `FROM`. Each `FROM` starts a new **stage**, with its own base image and its own layers. A later stage can copy files from an earlier one with `COPY --from=<stage>`.
+
+Only the **last** stage becomes the image. Everything in the earlier stages (their base image, tools and temporary files) is thrown away, except the files you copy out.
+
+This lets you split the work in two:
+
+1. **Build stage:** a big image with all the tools you need to build the app. Here, `node:20` (Debian, 1.1 GB) runs `npm ci`.
+2. **Production stage:** a small image with only what the app needs to **run**. Here, plain `alpine:3.19` with Node.js.
+
+Think of the build stage as a workshop and the production stage as the box you ship: you build in the workshop, then put only the finished product in the box.
+
+### How this Dockerfile works
+
+#### Stage 1: build (`node-builder`)
+
+- `FROM node:20 AS node-builder` starts the first stage from the full Debian Node.js image. `AS node-builder` gives the stage a name, so later lines can refer to it.
+- `RUN mkdir /build` creates the folder `/build`. (`WORKDIR` on the next line would create it anyway, so this line is not needed.)
+- `WORKDIR /build` makes `/build` the current directory.
+- `COPY package*.json ./` and `RUN npm ci` install the dependencies into `/build/node_modules`, in the same cache-friendly order as App 2. See [Faster builds: copy package files first](#faster-builds-copy-package-files-first).
+- `COPY . .` copies the rest of the app.
+
+At the end of this stage, `/build` holds the complete, ready-to-run app: `index.js`, `package.json`, `package-lock.json` and `node_modules`.
+
+This stage has no `USER`, so it runs as `root`. That is fine here, because nothing from this stage runs in the final container. Only its files are copied out.
+
+#### Stage 2: production
+
+- `FROM alpine:3.19` starts a new, empty stage from plain Alpine. Nothing from stage 1 is here yet.
+- `RUN apk add --update nodejs npm`, `RUN addgroup -S node && adduser -S node -G node` and `USER node` are the same as [App 3 Version 2](#version-2-install-nodejs-on-plain-alpine).
+- `RUN mkdir /home/node/code` creates the app folder as `node`. (`WORKDIR` would create it anyway, so this line is not needed either.)
+- `WORKDIR /home/node/code` makes it the current directory.
+- `COPY --from=node-builder --chown=node:node /build .` is the key line:
+  - `--from=node-builder` copies from the `node-builder` stage, **not** from your project folder.
+  - `/build` is the folder to copy from in that stage, and `.` is the current directory here (`/home/node/code`).
+  - `--chown=node:node` makes `node` the owner of every copied file, including `node_modules`.
+- `CMD ["node", "index.js"]` starts the server.
+
+The production stage never runs `npm ci`. It receives `node_modules` already installed.
+
+### What ends up in the final image
+
+`docker history` on the final image shows only the production stage's layers:
+
+| Layer | Size |
+| --- | --- |
+| `alpine:3.19` base | 7.7 MB |
+| `RUN apk add --update nodejs npm` | 64.6 MB |
+| `RUN addgroup ... adduser ...` | 4.7 kB |
+| `RUN mkdir`, `USER`, `WORKDIR`, `CMD` | 0 B |
+| `COPY --from=node-builder ... /build .` | 8.35 MB |
+| **Total** | **80.7 MB** |
+
+The 1.1 GB `node:20` image, the npm download cache and everything else in stage 1 are **not** in it. Inside the container, `/home/node/code` has the same files as in App 3, all owned by `node`.
+
+### Build and run the multi-stage app
+
+```sh
+cd multi-stage-builds
+docker build . -t my-fastify-app:multi-stage
+docker run --init --publish 8080:8080 --rm --name fa my-fastify-app:multi-stage
+```
+
+The build output names each step with its stage, for example `[node-builder 5/6] RUN npm ci` and `[stage-1 6/6] COPY --from=node-builder ...`. The production stage has no `AS` name, so Docker calls it `stage-1` (stages are numbered from 0). BuildKit runs steps from different stages **at the same time** when they do not depend on each other. For example, `apk add` in stage 2 runs while `npm ci` runs in stage 1.
+
+The app works like App 2 and App 3: <http://localhost:8080> returns `{"hello":"world"}`, and `ps aux` shows `/sbin/docker-init -- node index.js`.
+
+To build **only** the first stage, for example to debug it, use `--target`:
+
+```sh
+docker build . --target node-builder -t my-fastify-app:builder   # 1.11 GB
+```
+
+### Single-stage and multi-stage compared
+
+Measured on this project, with the same app:
+
+| | App 2 | App 3 (Version 2) | App 4 |
+| --- | --- | --- | --- |
+| Dockerfile | One stage, `node:20` | One stage, `alpine:3.19` + apk | Build on `node:20`, run on `alpine:3.19` |
+| Where `npm ci` runs | In the final image | In the final image | In the build stage only |
+| Image size | 1.11 GB | 82.4 MB | **80.7 MB** |
+| Node.js version that runs the app | v20.20.2 | v20.15.1 | v20.15.1 |
+
+App 4 is only slightly smaller than App 3 (Version 2), because both end with Alpine plus Node.js and npm. The difference is files that `npm ci` leaves behind, like its download cache, which stay in stage 1. The big win of multi-stage builds comes when the build needs heavy tools the app does not need to run, such as compilers, TypeScript or a frontend bundler. See [When to use multi-stage builds](#when-to-use-multi-stage-builds).
+
+### Watch out: native modules
+
+In this Dockerfile, `npm ci` runs on **Debian** (glibc, Node.js v20.20.2), but the app runs on **Alpine** (musl, Node.js v20.15.1). See [Things that work differently on Alpine](#things-that-work-differently-on-alpine).
+
+- **Fastify is plain JavaScript**, so the copied `node_modules` works on Alpine without problems.
+- **A package with native code** (such as `bcrypt` or `sharp`) would be compiled or downloaded for Debian and glibc in stage 1. Copied to Alpine, it would fail to load, with errors about missing libraries or symbols.
+
+To be safe, build and run on the **same** system and Node.js version, for example both on Alpine:
+
+```dockerfile
+FROM node:20-alpine AS node-builder
+...
+
+FROM node:20-alpine
+...
+```
+
+### Making it smaller and simpler
+
+These changes are optional. They are tested on this project:
+
+- **Do not install npm in the production stage.** The app is already installed when it is copied in, so only `node` is needed to run it. `--no-cache` also leaves out apk's package list:
+
+  ```dockerfile
+  RUN apk add --no-cache nodejs
+  ```
+
+  The image shrinks from **80.7 MB** to **71.1 MB**, and the app still runs. Without npm in the image, nobody can install packages into the running container.
+- **Remove the two `RUN mkdir` lines.** `WORKDIR` creates the folder anyway (owned by the current `USER`, see [More about WORKDIR](#more-about-workdir)), and each `RUN` adds a step to the build.
+- **Name the production stage**, for example `FROM alpine:3.19 AS production`. Then the build output says `production` instead of `stage-1`.
+- **Use a supported Alpine version.** Alpine 3.19 no longer gets security updates. See [Which version to use](#which-version-to-use).
+
+### When to use multi-stage builds
+
+**Benefits:**
+
+- **Smaller final image.** Build tools, caches and source files stay in the build stage.
+- **More secure.** Compilers, package managers and build secrets are not in the image you run, so there is less to attack.
+- **One Dockerfile for building and running.** You do not need separate build scripts on your machine.
+- **Build stages can use any image.** For example, build with a full `node:20` and run on a small `alpine`.
+
+**Use a multi-stage build when:**
+
+- The build needs tools the app does not need to run: TypeScript (`tsc`), a bundler (Vite, webpack), compilers for native modules, or dev dependencies for tests.
+- The build creates output that is much smaller than what was needed to make it, for example a frontend built into static files, or a Go or Rust program compiled into one binary.
+- You want the production image to be as small and safe as possible.
+
+**A single stage is enough when** the app needs nothing at build time except `npm ci`, like this Fastify app. Then a small single-stage image gets nearly the same result with fewer lines and no risk of a system mismatch: [App 3 Version 2](#version-2-install-nodejs-on-plain-alpine) is 82.4 MB, against 80.7 MB here. [App 3 Version 1](#app-3-alpine-linux) (`node:20-alpine`, 146 MB) is bigger, but gives you an up-to-date Node.js.
+
+---
+
+## App 5: distroless
+
+This app, in the `distroless/` folder, is the same Fastify app again, with a multi-stage build like App 4. The difference is the production stage: instead of Alpine, it runs on a **distroless** image.
+
+```dockerfile
+# build stage
+FROM node:20 AS node-builder
+WORKDIR /build
+COPY package-lock.json package.json ./
+RUN npm ci
+COPY . .
+
+# runtime stage
+FROM gcr.io/distroless/nodejs20
+COPY --from=node-builder --chown=node:node /build /app
+WORKDIR /app
+CMD ["index.js"]
+```
+
+### What is distroless?
+
+[Distroless](https://github.com/GoogleContainerTools/distroless) images are made by Google. They contain **only your app's runtime** (here Node.js) and the few system files it needs, such as certificates, time zone data and `/etc/passwd`. They have **no** Linux distribution tools at all:
+
+- no shell (`sh` or `bash`)
+- no package manager (`apt-get` or `apk`)
+- no basic commands (`ls`, `cat`, `ps`, `whoami`)
+
+They are built on Debian 12, so they use **glibc**, like `node:20`, not musl like Alpine.
+
+| | Alpine (App 4's production stage) | Distroless (App 5's production stage) |
+| --- | --- | --- |
+| Based on | Alpine Linux | Debian 12, with almost everything removed |
+| C library | musl | glibc |
+| Shell and basic commands | `sh` and BusyBox | None |
+| Package manager | `apk` | None |
+| Node.js | Installed by you with `apk` (v20.15.1) | Built into the image (v20.20.2) |
+
+The idea: a container only needs to **run one program**. Everything else in the image is something an attacker could use, and something that can have security holes.
+
+### How the distroless Dockerfile works
+
+#### Stage 1: build (`node-builder`)
+
+The same as App 4, with two small differences:
+
+- There is no `RUN mkdir /build`. `WORKDIR /build` creates the folder by itself.
+- `COPY package-lock.json package.json ./` names both files instead of using `package*.json`. The result is the same.
+
+#### Stage 2: runtime
+
+- `FROM gcr.io/distroless/nodejs20` uses the distroless Node.js 20 image. It comes from Google's registry (`gcr.io`), not Docker Hub, so the image name includes the registry address. Without a tag, Docker uses `latest`.
+- `COPY --from=node-builder --chown=node:node /build /app` copies the installed app from stage 1 into `/app`. Docker creates `/app`. (`--chown=node:node` does not work here, see [Problem 1: the app runs as root](#problem-1-the-app-runs-as-root).)
+- `WORKDIR /app` makes `/app` the current directory.
+- `CMD ["index.js"]` gives only the file name, **not** `node index.js`. The distroless image already sets `ENTRYPOINT ["/nodejs/bin/node"]`, and Docker adds the `CMD` to the end of the `ENTRYPOINT`. The container runs `/nodejs/bin/node index.js`.
+
+There is no `RUN` in this stage, and there could not be: `RUN` needs a shell, and distroless has none. Everything that needs commands must happen in the build stage.
+
+#### ENTRYPOINT and CMD
+
+This is the first app in this README where the difference matters:
+
+| | What it is | Set by |
+| --- | --- | --- |
+| `ENTRYPOINT` | The program that always runs. | The distroless image: `/nodejs/bin/node` |
+| `CMD` | The default **arguments** for the `ENTRYPOINT`. You can replace them in `docker run`. | This Dockerfile: `index.js` |
+
+So `docker run more-complicated-app:distroless other.js` runs `node other.js`. If you wrote `CMD ["node", "index.js"]` here, the container would run `node node index.js` and fail, because there is no file called `node`. The `node` images use the `ENTRYPOINT` `docker-entrypoint.sh` for the same reason (see [ps aux](#processes-inside-a-container-ps-aux)).
+
+### Build and run the distroless app
+
+```sh
+cd distroless
+docker build . -t more-complicated-app:distroless
+docker run --init --publish 8080:8080 --rm --name dl more-complicated-app:distroless
+```
+
+The app works like the others: <http://localhost:8080> returns `{"hello":"world"}`, with the same JSON logs. `--init` works too, because Docker adds `docker-init` from the outside, so it does not need a shell in the image.
+
+The image is **145 MB**: about 137 MB for the distroless Node.js image and 8.35 MB for the app.
+
+`docker image ls` shows the distroless base image as created "56 years ago". This is not a mistake: distroless images are built with a fixed date (1 January 1970), so that building the same image twice gives exactly the same result.
+
+### Living without a shell
+
+With no shell, the usual ways to look inside a container fail:
+
+```sh
+docker exec -it dl sh
+# exec: "sh": executable file not found in $PATH
+```
+
+What still works:
+
+- **`docker logs dl`** shows the app's output.
+- **`docker top dl`** lists the processes from outside the container, so it does not need `ps`.
+- **Node.js itself** is in the image, so you can run JavaScript with it:
+
+  ```sh
+  docker exec dl /nodejs/bin/node -e 'console.log(process.getuid())'
+  ```
+
+- **The `:debug` images** add a BusyBox shell, for debugging only. Do not deploy them:
+
+  ```sh
+  docker run -it --rm --entrypoint sh gcr.io/distroless/nodejs20-debian12:debug
+  ```
+
+### Problem 1: the app runs as root
+
+This Dockerfile has **no `USER`**, so the app runs as `root`. `docker top dl` shows `root` in the `USER` column, and `process.getuid()` prints `0`. This undoes the work from [Running as a non-root user](#running-as-a-non-root-user).
+
+`--chown=node:node` does not help, because **distroless has no `node` user**. Its `/etc/passwd` has only three users:
+
+| User | UID | Purpose |
+| --- | --- | --- |
+| `root` | `0` | The default user. |
+| `nobody` | `65534` | A user with no rights. |
+| `nonroot` | `65532` | The normal user for running apps. |
+
+Docker did not stop with an error. The files simply ended up owned by `root` (`0:0`). You cannot create a `node` user either, because `adduser` needs a shell.
+
+**The fix:** use the `:nonroot` image, which already runs as `nonroot`, and give the files to that user:
+
+```dockerfile
+FROM gcr.io/distroless/nodejs20-debian12:nonroot
+COPY --from=node-builder --chown=nonroot:nonroot /build /app
+WORKDIR /app
+CMD ["index.js"]
+```
+
+Tested on this project: the app runs as UID `65532`, the files are owned by `65532`, and it still returns `{"hello":"world"}`. `nodejs20-debian12` is the full name of the same image, with the Debian version written out.
+
+### Problem 2: no .dockerignore
+
+The other apps have a `.dockerignore`, but this folder does not. So `COPY . .` in stage 1 copies **everything** in the folder:
+
+- Your local `node_modules` (installed on macOS) is copied **over** the one that `npm ci` just installed for Linux. This app still works, because Fastify is plain JavaScript. But any package with native code would break. See [Leaving files out: .dockerignore](#leaving-files-out-dockerignore).
+- The build sends 8.5 MB to Docker instead of a few kB, so every build starts slower.
+- The `Dockerfile` itself ends up in `/app`.
+
+**The fix:** add the same `.dockerignore` as the other apps:
+
+```
+node_modules/
+.git/
+```
+
+### Distroless compared with the other apps
+
+Measured on this project, with the same Fastify app:
+
+| | App 2 | App 4 | App 5 |
+| --- | --- | --- | --- |
+| Runs on | `node:20` (Debian) | `alpine:3.19` + apk | `gcr.io/distroless/nodejs20` |
+| Image size | 1.11 GB | 80.7 MB | 145 MB |
+| Node.js version | v20.20.2 | v20.15.1 | v20.20.2 |
+| Built and run on the same system | Yes | No (Debian, then Alpine) | Yes (both Debian 12, glibc) |
+| Shell | `bash` | `sh` | None |
+| Package manager | `apt-get` | `apk` | None |
+| User | `node` | `node` (UID 100) | `root` (or `nonroot` with `:nonroot`) |
+
+- **Distroless is bigger than Alpine** (145 MB against 80.7 MB), mostly because its Node.js layer (99 MB) is the full official build, which is bigger than Alpine's `nodejs` package. But it has far fewer **programs**: only Node.js, with nothing an attacker can use to explore or change the container.
+- **No native-module problem.** Stage 1 (`node:20`) and stage 2 are both Debian 12 with glibc, and both run Node.js v20.20.2. Packages with native code built in stage 1 work in stage 2, unlike in [App 4](#watch-out-native-modules).
+- **Up-to-date Node.js.** The image comes with Node.js already built in, and Google keeps it updated. You do not depend on the version an Alpine release ships.
+
+### When to use distroless
+
+**Benefits:**
+
+- **Very small attack surface.** No shell, no package manager and no basic commands, so an attacker who gets in has almost nothing to work with.
+- **Fewer security warnings.** Security scanners find far fewer packages to report on.
+- **glibc, like the build stage.** Native modules built on `node:20` work without changes.
+- **Current Node.js**, maintained by Google.
+
+**Drawbacks:**
+
+- **Hard to debug.** No shell, no `ls`, no `ps`. You need `docker logs`, `docker top` or a `:debug` image.
+- **Must be a multi-stage build.** You cannot run `npm ci` or any other command in the runtime image.
+- **No `node` user, and root by default.** Use the `:nonroot` image.
+- **Fewer choices.** Google publishes only some runtimes and versions. You cannot add a package if the app needs one.
+
+**Use distroless when** the app is going to production, you already use a multi-stage build, and security matters more than easy debugging. Use the `:nonroot` image.
+
+**Use Alpine or `node:20-slim` when** you need a shell to debug or run scripts in the container, or the app needs extra system packages at run time.
+
+---
+
+## App 6: static-asset-project
+
+Apps 1 to 5 were Node.js **servers**: Node.js had to run inside the container to answer each request. This app is a **static website**. Node.js is needed only to **build** it into plain HTML, CSS and JavaScript files. After that, any web server can send those files, and Node.js is not needed at all.
+
+```dockerfile
+# build step
+FROM node:20 AS node-builder
+WORKDIR /app
+COPY . .
+RUN npm ci
+RUN npm run build
+
+#production step
+FROM nginx:alpine
+COPY --from=node-builder /app/dist /usr/share/nginx/html
+```
+
+This is the multi-stage idea from [App 4](#app-4-multi-stage-builds) taken all the way: the final image has **no Node.js**, only a web server and the built files.
+
+### The app: an Astro website
+
+The folder is the "basics" starter project of [Astro](https://astro.build), a framework for building websites:
+
+- `src/pages/index.astro` is the home page. `src/layouts/` and `src/components/` hold the parts it is built from.
+- `public/` holds files that are copied as they are, like `favicon.svg`.
+- `astro.config.mjs` turns on React and [Tailwind CSS](https://tailwindcss.com) (a CSS framework). `tailwind.config.mjs` and `tsconfig.json` configure Tailwind and TypeScript.
+- `package.json` lists Astro, React, Tailwind and TypeScript, with about 400 packages in `node_modules` (198 MB).
+
+The `build` script in `package.json` is:
+
+```json
+"build": "astro check && astro build"
+```
+
+- `astro check` checks the code for TypeScript errors. The build stops if it finds any.
+- `astro build` turns the project into a static website in the `dist/` folder.
+
+The result is small: `dist/` is only **155 kB** (`index.html`, `favicon.svg` and an `_astro/` folder with the CSS and JavaScript). That is what goes into the final image.
+
+### How the static site Dockerfile works
+
+#### Stage 1: build (`node-builder`)
+
+- `FROM node:20 AS node-builder` uses the full Debian Node.js image, which has everything the build needs.
+- `WORKDIR /app` creates `/app` and makes it the current directory.
+- `COPY . .` copies the whole project folder. See [Improving the static site build](#improving-the-static-site-build) for two problems with copying everything at this point.
+- `RUN npm ci` installs the dependencies.
+- `RUN npm run build` runs the `build` script, which creates `/app/dist`.
+
+This stage has no `USER` and runs as `root`. As in App 5, that is fine, because none of it runs in the final container.
+
+#### Stage 2: production
+
+- `FROM nginx:alpine` uses the official [nginx](#what-is-nginx) image, built on Alpine.
+- `COPY --from=node-builder /app/dist /usr/share/nginx/html` copies the built website into the folder that nginx serves files from.
+
+There is **no `CMD`**. The `nginx:alpine` image already has one (`nginx -g daemon off;`), and this stage keeps it. It also keeps the image's `ENTRYPOINT` (`/docker-entrypoint.sh`) and its `EXPOSE 80`.
+
+There is no `--chown` either. nginx only **reads** these files, and they are readable by everyone, so `root` can own them.
+
+### What is nginx?
+
+[nginx](https://nginx.org) ("engine x") is a web server. It is very fast at sending files, and it is often also used in front of other apps (as a reverse proxy or load balancer).
+
+The `nginx` image is set up to work without any configuration:
+
+| Setting | Value |
+| --- | --- |
+| Folder it serves files from | `/usr/share/nginx/html` |
+| Port it listens on | `80` (the image declares `EXPOSE 80`) |
+| Default file for a folder | `index.html`, so `/` returns `/usr/share/nginx/html/index.html` |
+| Command | `nginx -g daemon off;` |
+
+`daemon off;` keeps nginx in the foreground. Normally nginx starts and moves itself into the background, but in a container the main process must keep running, or the container stops (see [Earlier version: a one-line script](#earlier-version-a-one-line-script)).
+
+### Build and run the static site
+
+```sh
+cd static-asset-project
+docker build . -t my-static-site
+docker run --publish 8080:80 --rm --name site my-static-site
+```
+
+- `--publish 8080:80` maps port `8080` on your machine to nginx's port `80` in the container. Open <http://localhost:8080> to see the "Welcome to Astro." page.
+- `--init` is not needed. nginx is made to run as PID 1 and handles `Ctrl+C` and `docker stop` itself, so `docker stop site` stops it in about a second.
+
+The build takes about 25 seconds the first time: `npm ci` takes about 12 seconds, and `npm run build` about 6. The build output shows `astro check` reporting `0 errors`, then `astro build` building the pages.
+
+nginx logs one line per request, in the standard web server format:
+
+```
+172.17.0.1 - - [29/Oct/2026:18:30:23 +0000] "GET /favicon.svg HTTP/1.1" 200 749 "-" "curl/8.7.1" "-"
+```
+
+A file that does not exist returns `404` and also logs an `[error]` line.
+
+### What is inside the final image
+
+| | |
+| --- | --- |
+| Image size | **62.8 MB**, of which the website is 155 kB |
+| Build stage size (thrown away) | 1.51 GB |
+| Node.js | Not installed |
+| nginx version | 1.31.8 |
+
+`ls -la /usr/share/nginx/html` in the container shows the built site, plus `50x.html`, the error page that comes with nginx:
+
+```
+50x.html
+_astro/
+favicon.svg
+index.html
+```
+
+`docker exec site ps aux` shows how nginx runs:
+
+```
+PID   USER     TIME  COMMAND
+    1 root      0:00 nginx: master process nginx -g daemon off;
+   30 nginx     0:00 nginx: worker process
+   31 nginx     0:00 nginx: worker process
+   ...
+```
+
+- The **master** process runs as `root`. It reads the configuration, opens port 80 and starts the workers.
+- The **worker** processes answer the requests. They run as the `nginx` user, not `root`. There is one per CPU core.
+
+So nginx does its own [non-root](#running-as-a-non-root-user) setup: the processes that handle requests from the internet do not run as `root`, even without a `USER` line.
+
+### Your Dockerfile and solution.Dockerfile
+
+The folder also has `solution.Dockerfile`. Its build stage is the same. The only difference is the production base image:
+
+```dockerfile
+# you could totally use nginx:alpine here too
+FROM nginx:latest
+```
+
+| | `Dockerfile` (`nginx:alpine`) | `solution.Dockerfile` (`nginx:latest`) |
+| --- | --- | --- |
+| Base | Alpine | Debian 13 |
+| nginx version | 1.31.8 | 1.31.8 |
+| Image size | **62.8 MB** | 183 MB |
+
+Both serve the same website with the same nginx version. The Alpine version is about 3 times smaller. nginx does not need any native npm modules, so Alpine's [musl differences](#things-that-work-differently-on-alpine) do not matter here.
+
+To build the other file, give its name with `-f`:
+
+```sh
+docker build . -f solution.Dockerfile -t my-static-site:debian
+```
+
+### Improving the static site build
+
+The Dockerfile works, but it has the same two problems that [App 2](#app-2-build-a-more-complicated-nodejs-app) solved:
+
+1. **No `.dockerignore`.** `COPY . .` copies the whole folder, including your local `node_modules` (198 MB), and Docker has to send all of it to the build. The build still works, because `npm ci` deletes `node_modules` first and installs it again, but sending it is slow. Old `dist/` and `.astro/` folders are copied too.
+2. **`COPY . .` comes before `RUN npm ci`.** When you change any file, even one line of `index.astro`, the `COPY . .` step changes, so `npm ci` runs again and downloads about 400 packages. See [Faster builds: copy package files first](#faster-builds-copy-package-files-first).
+
+Add a `.dockerignore` (the same folders as the project's `.gitignore`):
+
+```
+node_modules/
+dist/
+.astro/
+.git/
+```
+
+And copy the package files first:
+
+```dockerfile
+FROM node:20 AS node-builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=node-builder /app/dist /usr/share/nginx/html
+```
+
+With these two changes, Docker no longer sends `node_modules` to the build, and when only the website's code changes, `npm ci` stays `CACHED`.
+
+### When to serve static files with nginx
+
+**This setup works for** any project that builds to plain files: Astro, Vite, React (Create React App), Vue, Angular, Svelte, Hugo, a documentation site, or hand-written HTML. If the build output is a folder of HTML, CSS and JavaScript, you can serve it with nginx.
+
+**Benefits:**
+
+- **Small image.** 62.8 MB, with no Node.js and no `node_modules`.
+- **Fast.** nginx is built to send files, and it does it faster and with less memory than a Node.js server.
+- **Safer.** No Node.js, npm or app code runs in the container, so there is less that can have security holes. The workers do not run as `root`.
+- **No server code.** You do not write or maintain a server like `index.js` in Apps 1 to 5.
+
+**It does not work when** the site needs code on the server for each request, for example a login, a database, an API, or pages rendered on the server (Astro's server mode, Next.js server features). Then you need a Node.js server, as in Apps 1 to 5. nginx is often still used **in front of** it.
+
+To change how nginx behaves (for example, single-page apps that need every path to return `index.html`, caching headers, or redirects), copy your own configuration file into `/etc/nginx/conf.d/default.conf`.
