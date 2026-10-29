@@ -6,11 +6,14 @@
    - [Images](#images)
    - [Running containers](#running-containers)
    - [Managing containers](#managing-containers)
+   - [Processes inside a container: ps aux](#processes-inside-a-container-ps-aux)
    - [Cleaning up](#cleaning-up)
    - [System information](#system-information)
 2. [The Dockerfile](#the-dockerfile)
    - [The app: index.js](#the-app-indexjs)
    - [How the Dockerfile works](#how-the-dockerfile-works)
+   - [Working directory: WORKDIR](#working-directory-workdir)
+   - [Running as a non-root user](#running-as-a-non-root-user)
    - [Build the image](#build-the-image)
    - [Run the web server](#run-the-web-server)
    - [Stop the server](#stop-the-server)
@@ -98,10 +101,53 @@ docker attach my-box            # connect to the original shell
 | `docker pause my-box` | Freezes all processes in the container. They keep their memory but use no CPU. |
 | `docker unpause my-box` | Resumes a paused container from where it stopped. |
 | `docker exec -it my-box bash` | Runs a command inside a **running** container. Here it opens a shell. |
+| `docker top my-box` | Lists the processes running in a container, from the outside. See [ps aux](#processes-inside-a-container-ps-aux). |
 | `docker attach my-box` | Connects your terminal to the container's main process. |
 | `docker logs my-box` | Shows the output of a container. Add `-f` to keep following new output. |
 | `docker inspect my-box` | Shows the full configuration of a container or image as JSON. |
 | `docker rm my-box` | Removes a stopped container. Add `-f` to stop and remove a running one. |
+
+### Processes inside a container: ps aux
+
+`ps aux` is a Linux command, not a Docker command. It lists every process that is running. Run it inside a container with `docker exec` to see what the container is doing and **which user** each process runs as.
+
+```sh
+docker exec na ps aux
+```
+
+The letters are three options:
+
+- `a`: show processes of **all** users, not only yours.
+- `u`: use the **user-oriented** format, which adds the `USER`, `%CPU` and `%MEM` columns.
+- `x`: also show processes that have no terminal, such as servers.
+
+With the web server from this project running (see [Run the web server](#run-the-web-server)), the output looks like this:
+
+```
+USER   PID %CPU %MEM    VSZ   RSS TTY  STAT START  TIME COMMAND
+lolcat   1  0.0  0.0   1088     4 ?    Ss   10:00  0:00 /sbin/docker-init -- node index.js
+lolcat   7  0.3  0.5 600000 45000 ?    Sl   10:00  0:00 node index.js
+lolcat  20  0.0  0.0   8000  4000 ?    Rs   10:01  0:00 ps aux
+```
+
+| Column | Meaning |
+| --- | --- |
+| `USER` | The user that runs the process. Here it is `lolcat`, because of `USER lolcat` in the Dockerfile. Without it, this column says `root`. |
+| `PID` | The process ID. Inside a container, numbering starts at 1. |
+| `%CPU`, `%MEM` | How much CPU and memory the process uses. |
+| `VSZ`, `RSS` | Virtual memory and real (resident) memory, in KB. |
+| `TTY` | The terminal the process is attached to. `?` means none. |
+| `STAT` | The state: `R` running, `S` sleeping (waiting for something, like a request), `s` session leader, `l` multi-threaded. |
+| `START`, `TIME` | When the process started, and how much CPU time it has used in total. |
+| `COMMAND` | The command that started the process. |
+
+Things you can see in this output:
+
+- **PID 1 is `docker-init`**, not Node.js, because of `--init`. Node.js runs under it. Without `--init`, `node` is PID 1. See [Why `--init`?](#why---init).
+- **Everything runs as `lolcat`**, not `root`. See [Running as a non-root user](#running-as-a-non-root-user).
+- The container runs very few processes, only the ones it needs. The `ps aux` line is the command you just ran.
+
+`docker top na` shows the same list from outside the container. It works even when the image has no `ps` command; small images such as `node:20-slim` or `alpine` variants may not include it.
 
 ### Cleaning up
 
@@ -128,7 +174,13 @@ A `Dockerfile` is a text file with the steps Docker follows to build an image. T
 ```dockerfile
 FROM node:20
 
-COPY index.js index.js
+RUN useradd -ms /bin/bash lolcat
+
+USER lolcat
+
+WORKDIR /home/lolcat/code
+
+COPY --chown=lolcat index.js .
 
 CMD [ "node", "index.js"]
 ```
@@ -157,16 +209,174 @@ console.log("server started");
 Each line is an **instruction**, and Docker runs them from top to bottom:
 
 - `FROM node:20` uses the official Node.js 20 image as the base. Every Dockerfile starts with `FROM`.
-- `COPY index.js index.js` copies `index.js` from your project folder (the build context) into the image. The first path is on your machine; the second is inside the image. There is no `WORKDIR`, so the file ends up at `/index.js`.
-- `CMD [ "node", "index.js"]` sets the default command a container runs when it starts: it runs the server.
+- `RUN useradd -ms /bin/bash lolcat` runs a Linux command during the build. It creates a new user called `lolcat` with the home folder `/home/lolcat`. See [Create your own user](#create-your-own-user-this-dockerfile).
+- `USER lolcat` makes the rest of the build, and the container, run as `lolcat` instead of `root`. See [Running as a non-root user](#running-as-a-non-root-user).
+- `WORKDIR /home/lolcat/code` creates the folder `/home/lolcat/code` and makes it the current directory for the steps after it and for the container. See [Working directory: WORKDIR](#working-directory-workdir).
+- `COPY --chown=lolcat index.js .` copies `index.js` from your project folder (the build context) into the image. The first path is on your machine; the second, `.`, means "the current directory" inside the image, which is `/home/lolcat/code` because of `WORKDIR`. So the file ends up at `/home/lolcat/code/index.js`. `--chown=lolcat` makes `lolcat` the owner of the copied file. See [File ownership: COPY --chown](#file-ownership-copy---chown).
+- `CMD [ "node", "index.js"]` sets the default command a container runs when it starts: it runs the server. A relative path is enough, because the container starts in the `WORKDIR`.
 
 `CMD` runs when you **start a container** (`docker run`), not when you **build the image** (`docker build`). To run something during the build, such as installing packages, use `RUN` instead.
 
-**Layers and caching:** An image is made of layers. Instructions that change files (`RUN`, `COPY`, `ADD`) each add a new layer; others such as `CMD` only change the image's settings. Docker caches every step, so when you change a line, it rebuilds only that step and the steps after it. Here, when you edit `index.js`, Docker reuses the cached `node:20` base and rebuilds only from `COPY` down. Put lines that change often (like copying your source code) near the bottom to keep builds fast.
+**Layers and caching:** An image is made of layers. Instructions that change files (`RUN`, `COPY`, `ADD`) each add a new layer; others such as `CMD` only change the image's settings. Docker caches every step, so when you change a line, it rebuilds only that step and the steps after it. Here, `RUN useradd` adds a layer (the new user's entries in `/etc/passwd` and its home folder), and `COPY` adds another. When you edit `index.js`, Docker reuses the cached `node:20` base, `RUN`, `USER` and `WORKDIR` steps (the build output shows `CACHED`), and rebuilds only from `COPY` down. Put lines that change often (like copying your source code) near the bottom to keep builds fast.
 
 You can see the layers of your image with `docker history my-node-app:3`.
 
-**Tip:** Most Dockerfiles add `WORKDIR /app` after `FROM`. It creates the folder and makes it the current directory, so your files do not land in the root (`/`) of the container.
+### Working directory: WORKDIR
+
+`WORKDIR` sets the **current directory** inside the image, like running `cd` in a terminal. If the folder does not exist, Docker creates it.
+
+```dockerfile
+WORKDIR /home/lolcat/code
+```
+
+Without a `WORKDIR`, the current directory is `/` (the root of the file system), unless the base image sets one. `node:20` does not.
+
+#### What WORKDIR affects
+
+Everything **after** it uses the new directory:
+
+| Where | Effect in this Dockerfile |
+| --- | --- |
+| `COPY` and `ADD` | A relative destination is relative to the `WORKDIR`. `COPY index.js .` puts the file at `/home/lolcat/code/index.js`. |
+| `RUN` | Commands run inside the `WORKDIR`. For example, `RUN npm install` would install into `/home/lolcat/code/node_modules`. |
+| `CMD` | The container starts in the `WORKDIR`, so `node index.js` finds the file. |
+| `docker exec` | Commands you run in the container also start there. |
+
+Check it while the server runs:
+
+```sh
+docker exec na pwd      # prints: /home/lolcat/code
+docker exec na ls -l    # lists index.js, without typing the full path
+```
+
+#### Before and after
+
+Without `WORKDIR`, every path has to be written in full:
+
+```dockerfile
+COPY --chown=lolcat index.js /home/lolcat/code/index.js
+CMD [ "node", "/home/lolcat/code/index.js"]
+```
+
+With `WORKDIR`, the folder is written once and the other lines get shorter:
+
+```dockerfile
+WORKDIR /home/lolcat/code
+COPY --chown=lolcat index.js .
+CMD [ "node", "index.js"]
+```
+
+If you move the app to another folder later, you only change the `WORKDIR` line.
+
+#### Why not `RUN cd`?
+
+Each `RUN` runs in a new shell, so a `cd` is forgotten as soon as that step ends:
+
+```dockerfile
+RUN cd /home/lolcat/code   # has no effect on the next lines
+RUN ls                     # still runs in /
+```
+
+Use `WORKDIR` instead. It is saved in the image's settings, so every later step and the container itself use it.
+
+#### More about WORKDIR
+
+- **Use absolute paths.** `WORKDIR` can be relative, but then it builds on the previous one: `WORKDIR /a` then `WORKDIR b` gives `/a/b`. An absolute path like `/home/lolcat/code` is clearer.
+- **Who owns the folder.** If `WORKDIR` creates the folder, the owner can depend on your Docker version: BuildKit (the default builder in current Docker) uses the current `USER`, here `lolcat`, while older builders use `root`. Check it with `docker exec na ls -ld /home/lolcat/code`. Here the folder is inside `/home/lolcat`, which `useradd -m` created for `lolcat`.
+- **Override it at run time.** `docker run --workdir /tmp my-node-app:3` (short form `-w`) starts the container in another folder. Here that breaks the app, because `node index.js` would look for `/tmp/index.js`.
+
+### Running as a non-root user
+
+By default, a container runs as `root`. The app does not need root to answer web requests, and if someone breaks into it, root gives them much more power: they can change any file in the container and have a better chance of escaping it. Running as a normal user limits the damage.
+
+The `USER` instruction picks the user. It affects everything after it:
+
+- `RUN` steps later in the Dockerfile run as that user.
+- The `CMD`, and anything you start with `docker exec`, run as that user.
+
+The user must already exist in the image. There are two ways to get one.
+
+#### Option 1: the built-in node user
+
+The official `node` images already have a user called `node` (home folder `/home/node`), so this is enough:
+
+```dockerfile
+FROM node:20
+USER node
+COPY index.js /home/node/code/index.js
+CMD [ "node", "/home/node/code/index.js"]
+```
+
+This was the previous version of this project's Dockerfile.
+
+#### Create your own user (this Dockerfile)
+
+Most base images do not come with a ready-made user, so you create one with `RUN useradd`:
+
+```dockerfile
+RUN useradd -ms /bin/bash lolcat
+USER lolcat
+```
+
+| Part | What it does |
+| --- | --- |
+| `useradd` | The Linux command that creates a user. It also creates a group with the same name. |
+| `-m` | Creates the user's home folder, `/home/lolcat`. Without it, the folder does not exist. |
+| `-s /bin/bash` | Sets the user's login shell to bash. The default for `useradd` on Debian (which `node:20` is built on) is `/bin/sh`. |
+| `-ms` | `-m` and `-s` combined. |
+| `lolcat` | The name of the new user. |
+
+The order matters:
+
+- `RUN useradd` must come **before** `USER lolcat`, because only `root` can create users.
+- `USER lolcat` must come **after** `RUN useradd`. If the user does not exist, the container fails to start with an error like `unable to find user lolcat`.
+
+Each user has a number (UID). The `node` user already has UID `1000`, so `lolcat` gets the next free one, `1001`.
+
+**Note:** `useradd` is for Debian and Ubuntu based images like `node:20`. Alpine images (`node:20-alpine`) use `adduser` instead.
+
+#### Check which user runs the app
+
+While the server runs:
+
+```sh
+docker exec na whoami     # prints: lolcat
+docker exec na id         # prints: uid=1001(lolcat) gid=1001(lolcat) groups=1001(lolcat)
+docker exec na ps aux     # the USER column says lolcat
+```
+
+See [Processes inside a container: ps aux](#processes-inside-a-container-ps-aux) for how to read the `ps aux` output.
+
+To get a root shell for debugging, override the user: `docker exec -it --user root na bash`.
+
+#### File ownership: COPY --chown
+
+`USER` does **not** change who owns copied files. Without `--chown`, `COPY` always creates files owned by `root`, even after `USER lolcat`, and even in `lolcat`'s home folder. Then `lolcat` can read `index.js` but cannot change it.
+
+That is why this Dockerfile uses `--chown`:
+
+```dockerfile
+COPY --chown=lolcat index.js .
+```
+
+| Form | Owner | Group |
+| --- | --- | --- |
+| `COPY index.js ...` | `root` | `root` |
+| `COPY --chown=lolcat index.js ...` | `lolcat` | the group with the same number as `lolcat`'s UID (`1001`), which here is the `lolcat` group |
+| `COPY --chown=lolcat:lolcat index.js ...` | `lolcat` | `lolcat`, named explicitly |
+
+`--chown=lolcat:lolcat` is the clearer form, because it names the group too. Both give the same result here, because `useradd` created a `lolcat` group with the same number as the user.
+
+Check the owners while the server runs:
+
+```sh
+docker exec na ls -l /home/lolcat/code/index.js   # owner and group: lolcat lolcat
+docker exec na ls -ld /home/lolcat/code           # the code folder that WORKDIR created
+```
+
+Now `lolcat` owns `index.js` and can change it. This server only reads its own file, so it works either way. Ownership starts to matter when the app writes files, for example logs, uploads or a `node_modules` folder that `npm install` creates.
+
+**Note:** `--chown` only works with user and group names that exist in the image, so `RUN useradd` must come before this `COPY`. It also only works for Linux containers.
 
 ### Build the image
 
