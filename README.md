@@ -38,6 +38,15 @@
    - [Version 2: install Node.js on plain Alpine](#version-2-install-nodejs-on-plain-alpine)
    - [Version 1 and Version 2 compared](#version-1-and-version-2-compared)
    - [Which version to use](#which-version-to-use)
+6. [App 4: multi-stage-builds](#app-4-multi-stage-builds)
+   - [What is a multi-stage build?](#what-is-a-multi-stage-build)
+   - [How this Dockerfile works](#how-this-dockerfile-works-1)
+   - [What ends up in the final image](#what-ends-up-in-the-final-image)
+   - [Build and run the multi-stage app](#build-and-run-the-multi-stage-app)
+   - [Single-stage and multi-stage compared](#single-stage-and-multi-stage-compared)
+   - [Watch out: native modules](#watch-out-native-modules)
+   - [Making it smaller and simpler](#making-it-smaller-and-simpler)
+   - [When to use multi-stage builds](#when-to-use-multi-stage-builds)
 
 ---
 
@@ -58,7 +67,13 @@ my_project/
 │   ├── index.js
 │   ├── package.json
 │   └── package-lock.json
-└── alpine-linux/                        # App 3: App 2 on a small Alpine Linux base image
+├── alpine-linux/                        # App 3: App 2 on a small Alpine Linux base image
+│   ├── .dockerignore
+│   ├── Dockerfile
+│   ├── index.js
+│   ├── package.json
+│   └── package-lock.json
+└── multi-stage-builds/                  # App 4: install on Debian, run on Alpine
     ├── .dockerignore
     ├── Dockerfile
     ├── index.js
@@ -66,7 +81,7 @@ my_project/
     └── package-lock.json
 ```
 
-`node_modules/` is not committed (see `.gitignore`). In App 2 and App 3, the image installs its own copy during the build.
+`node_modules/` is not committed (see `.gitignore`). In App 2, App 3 and App 4, the image installs its own copy during the build.
 
 ---
 
@@ -911,3 +926,165 @@ cd alpine-linux
 docker build . -t my-fastify-app:alpine-apk
 docker image ls my-fastify-app
 ```
+
+---
+
+## App 4: multi-stage-builds
+
+This app, in the `multi-stage-builds/` folder, runs the same Fastify app as App 2 and App 3. `index.js`, `package.json`, `package-lock.json` and `.dockerignore` are the same (only the `name` field differs). The difference is the `Dockerfile`: it builds the app in **two stages**.
+
+```dockerfile
+# build step
+FROM node:20 AS node-builder
+RUN mkdir /build
+WORKDIR /build
+COPY package*.json ./
+RUN npm ci
+COPY . .
+
+#production step
+FROM alpine:3.19
+RUN apk add --update nodejs npm
+RUN addgroup -S node && adduser -S node -G node
+USER node
+RUN mkdir /home/node/code
+WORKDIR /home/node/code
+COPY --from=node-builder --chown=node:node /build .
+CMD ["node", "index.js"]
+```
+
+### What is a multi-stage build?
+
+A Dockerfile can have more than one `FROM`. Each `FROM` starts a new **stage**, with its own base image and its own layers. A later stage can copy files from an earlier one with `COPY --from=<stage>`.
+
+Only the **last** stage becomes the image. Everything in the earlier stages (their base image, tools and temporary files) is thrown away, except the files you copy out.
+
+This lets you split the work in two:
+
+1. **Build stage:** a big image with all the tools you need to build the app. Here, `node:20` (Debian, 1.1 GB) runs `npm ci`.
+2. **Production stage:** a small image with only what the app needs to **run**. Here, plain `alpine:3.19` with Node.js.
+
+Think of the build stage as a workshop and the production stage as the box you ship: you build in the workshop, then put only the finished product in the box.
+
+### How this Dockerfile works
+
+#### Stage 1: build (`node-builder`)
+
+- `FROM node:20 AS node-builder` starts the first stage from the full Debian Node.js image. `AS node-builder` gives the stage a name, so later lines can refer to it.
+- `RUN mkdir /build` creates the folder `/build`. (`WORKDIR` on the next line would create it anyway, so this line is not needed.)
+- `WORKDIR /build` makes `/build` the current directory.
+- `COPY package*.json ./` and `RUN npm ci` install the dependencies into `/build/node_modules`, in the same cache-friendly order as App 2. See [Faster builds: copy package files first](#faster-builds-copy-package-files-first).
+- `COPY . .` copies the rest of the app.
+
+At the end of this stage, `/build` holds the complete, ready-to-run app: `index.js`, `package.json`, `package-lock.json` and `node_modules`.
+
+This stage has no `USER`, so it runs as `root`. That is fine here, because nothing from this stage runs in the final container. Only its files are copied out.
+
+#### Stage 2: production
+
+- `FROM alpine:3.19` starts a new, empty stage from plain Alpine. Nothing from stage 1 is here yet.
+- `RUN apk add --update nodejs npm`, `RUN addgroup -S node && adduser -S node -G node` and `USER node` are the same as [App 3 Version 2](#version-2-install-nodejs-on-plain-alpine).
+- `RUN mkdir /home/node/code` creates the app folder as `node`. (`WORKDIR` would create it anyway, so this line is not needed either.)
+- `WORKDIR /home/node/code` makes it the current directory.
+- `COPY --from=node-builder --chown=node:node /build .` is the key line:
+  - `--from=node-builder` copies from the `node-builder` stage, **not** from your project folder.
+  - `/build` is the folder to copy from in that stage, and `.` is the current directory here (`/home/node/code`).
+  - `--chown=node:node` makes `node` the owner of every copied file, including `node_modules`.
+- `CMD ["node", "index.js"]` starts the server.
+
+The production stage never runs `npm ci`. It receives `node_modules` already installed.
+
+### What ends up in the final image
+
+`docker history` on the final image shows only the production stage's layers:
+
+| Layer | Size |
+| --- | --- |
+| `alpine:3.19` base | 7.7 MB |
+| `RUN apk add --update nodejs npm` | 64.6 MB |
+| `RUN addgroup ... adduser ...` | 4.7 kB |
+| `RUN mkdir`, `USER`, `WORKDIR`, `CMD` | 0 B |
+| `COPY --from=node-builder ... /build .` | 8.35 MB |
+| **Total** | **80.7 MB** |
+
+The 1.1 GB `node:20` image, the npm download cache and everything else in stage 1 are **not** in it. Inside the container, `/home/node/code` has the same files as in App 3, all owned by `node`.
+
+### Build and run the multi-stage app
+
+```sh
+cd multi-stage-builds
+docker build . -t my-fastify-app:multi-stage
+docker run --init --publish 8080:8080 --rm --name fa my-fastify-app:multi-stage
+```
+
+The build output names each step with its stage, for example `[node-builder 5/6] RUN npm ci` and `[stage-1 6/6] COPY --from=node-builder ...`. The production stage has no `AS` name, so Docker calls it `stage-1` (stages are numbered from 0). BuildKit runs steps from different stages **at the same time** when they do not depend on each other. For example, `apk add` in stage 2 runs while `npm ci` runs in stage 1.
+
+The app works like App 2 and App 3: <http://localhost:8080> returns `{"hello":"world"}`, and `ps aux` shows `/sbin/docker-init -- node index.js`.
+
+To build **only** the first stage, for example to debug it, use `--target`:
+
+```sh
+docker build . --target node-builder -t my-fastify-app:builder   # 1.11 GB
+```
+
+### Single-stage and multi-stage compared
+
+Measured on this project, with the same app:
+
+| | App 2 | App 3 (Version 2) | App 4 |
+| --- | --- | --- | --- |
+| Dockerfile | One stage, `node:20` | One stage, `alpine:3.19` + apk | Build on `node:20`, run on `alpine:3.19` |
+| Where `npm ci` runs | In the final image | In the final image | In the build stage only |
+| Image size | 1.11 GB | 82.4 MB | **80.7 MB** |
+| Node.js version that runs the app | v20.20.2 | v20.15.1 | v20.15.1 |
+
+App 4 is only slightly smaller than App 3 (Version 2), because both end with Alpine plus Node.js and npm. The difference is files that `npm ci` leaves behind, like its download cache, which stay in stage 1. The big win of multi-stage builds comes when the build needs heavy tools the app does not need to run, such as compilers, TypeScript or a frontend bundler. See [When to use multi-stage builds](#when-to-use-multi-stage-builds).
+
+### Watch out: native modules
+
+In this Dockerfile, `npm ci` runs on **Debian** (glibc, Node.js v20.20.2), but the app runs on **Alpine** (musl, Node.js v20.15.1). See [Things that work differently on Alpine](#things-that-work-differently-on-alpine).
+
+- **Fastify is plain JavaScript**, so the copied `node_modules` works on Alpine without problems.
+- **A package with native code** (such as `bcrypt` or `sharp`) would be compiled or downloaded for Debian and glibc in stage 1. Copied to Alpine, it would fail to load, with errors about missing libraries or symbols.
+
+To be safe, build and run on the **same** system and Node.js version, for example both on Alpine:
+
+```dockerfile
+FROM node:20-alpine AS node-builder
+...
+
+FROM node:20-alpine
+...
+```
+
+### Making it smaller and simpler
+
+These changes are optional. They are tested on this project:
+
+- **Do not install npm in the production stage.** The app is already installed when it is copied in, so only `node` is needed to run it. `--no-cache` also leaves out apk's package list:
+
+  ```dockerfile
+  RUN apk add --no-cache nodejs
+  ```
+
+  The image shrinks from **80.7 MB** to **71.1 MB**, and the app still runs. Without npm in the image, nobody can install packages into the running container.
+- **Remove the two `RUN mkdir` lines.** `WORKDIR` creates the folder anyway (owned by the current `USER`, see [More about WORKDIR](#more-about-workdir)), and each `RUN` adds a step to the build.
+- **Name the production stage**, for example `FROM alpine:3.19 AS production`. Then the build output says `production` instead of `stage-1`.
+- **Use a supported Alpine version.** Alpine 3.19 no longer gets security updates. See [Which version to use](#which-version-to-use).
+
+### When to use multi-stage builds
+
+**Benefits:**
+
+- **Smaller final image.** Build tools, caches and source files stay in the build stage.
+- **More secure.** Compilers, package managers and build secrets are not in the image you run, so there is less to attack.
+- **One Dockerfile for building and running.** You do not need separate build scripts on your machine.
+- **Build stages can use any image.** For example, build with a full `node:20` and run on a small `alpine`.
+
+**Use a multi-stage build when:**
+
+- The build needs tools the app does not need to run: TypeScript (`tsc`), a bundler (Vite, webpack), compilers for native modules, or dev dependencies for tests.
+- The build creates output that is much smaller than what was needed to make it, for example a frontend built into static files, or a Go or Rust program compiled into one binary.
+- You want the production image to be as small and safe as possible.
+
+**A single stage is enough when** the app needs nothing at build time except `npm ci`, like this Fastify app. Then a small single-stage image gets nearly the same result with fewer lines and no risk of a system mismatch: [App 3 Version 2](#version-2-install-nodejs-on-plain-alpine) is 82.4 MB, against 80.7 MB here. [App 3 Version 1](#app-3-alpine-linux) (`node:20-alpine`, 146 MB) is bigger, but gives you an up-to-date Node.js.
