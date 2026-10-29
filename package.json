@@ -1,0 +1,24 @@
+{
+  "name": "my_project",
+  "version": "1.0.0",
+  "description": "1. [Docker commands](#docker-commands)    - [Images](#images)    - [Running containers](#running-containers)    - [Managing containers](#managing-containers)    - [Processes inside a container: ps aux](#processes-inside-a-container-ps-aux)    - [Cleaning up](#cleaning-up)    - [System information](#system-information) 2. [The Dockerfile](#the-dockerfile)    - [The app: index.js](#the-app-indexjs)    - [How the Dockerfile works](#how-the-dockerfile-works)    - [Working directory: WORKDIR](#working-directory-workdir)    - [Running as a non-root user](#running-as-a-non-root-user)    - [Build the image](#build-the-image)    - [Run the web server](#run-the-web-server)    - [Stop the server](#stop-the-server)    - [Earlier version: a one-line script](#earlier-version-a-one-line-script)",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ghazaleh-ans/Docker_basics.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Ghazaleh-ans/Docker_basics/issues"
+  },
+  "homepage": "https://github.com/Ghazaleh-ans/Docker_basics#readme",
+  "dependencies": {
+    "fastify": "^5.12.7"
+  }
+}
