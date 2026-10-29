@@ -2,14 +2,15 @@
 
 ## Contents
 
-1. [Docker commands](#docker-commands)
+1. [Project structure](#project-structure)
+2. [Docker commands](#docker-commands)
    - [Images](#images)
    - [Running containers](#running-containers)
    - [Managing containers](#managing-containers)
    - [Processes inside a container: ps aux](#processes-inside-a-container-ps-aux)
    - [Cleaning up](#cleaning-up)
    - [System information](#system-information)
-2. [The Dockerfile](#the-dockerfile)
+3. [App 1: build-a-nodejs-app](#app-1-build-a-nodejs-app)
    - [The app: index.js](#the-app-indexjs)
    - [How the Dockerfile works](#how-the-dockerfile-works)
    - [Working directory: WORKDIR](#working-directory-workdir)
@@ -18,6 +19,38 @@
    - [Run the web server](#run-the-web-server)
    - [Stop the server](#stop-the-server)
    - [Earlier version: a one-line script](#earlier-version-a-one-line-script)
+4. [App 2: build-a-more-complicated-nodejs-app](#app-2-build-a-more-complicated-nodejs-app)
+   - [The app: Fastify](#the-app-fastify)
+   - [How this Dockerfile works](#how-this-dockerfile-works)
+   - [Installing dependencies: npm ci](#installing-dependencies-npm-ci)
+   - [Faster builds: copy package files first](#faster-builds-copy-package-files-first)
+   - [Leaving files out: .dockerignore](#leaving-files-out-dockerignore)
+   - [Build and run the Fastify app](#build-and-run-the-fastify-app)
+   - [Why host 0.0.0.0?](#why-host-0000)
+   - [App 1 and App 2 compared](#app-1-and-app-2-compared)
+
+---
+
+## Project structure
+
+Each app has its own folder, with its own `Dockerfile`. Build and run each one from inside its folder.
+
+```
+my_project/
+├── README.md
+├── .gitignore
+├── build-a-nodejs-app/                  # App 1: web server with no dependencies
+│   ├── Dockerfile
+│   └── index.js
+└── build-a-more-complicated-nodejs-app/ # App 2: Fastify server with npm dependencies
+    ├── .dockerignore
+    ├── Dockerfile
+    ├── index.js
+    ├── package.json
+    └── package-lock.json
+```
+
+`node_modules/` is not committed (see `.gitignore`). In App 2, the image installs its own copy during the build.
 
 ---
 
@@ -121,13 +154,13 @@ The letters are three options:
 - `u`: use the **user-oriented** format, which adds the `USER`, `%CPU` and `%MEM` columns.
 - `x`: also show processes that have no terminal, such as servers.
 
-With the web server from this project running (see [Run the web server](#run-the-web-server)), the output looks like this:
+With App 1's web server running (see [Run the web server](#run-the-web-server)), the output looks like this:
 
 ```
-USER   PID %CPU %MEM    VSZ   RSS TTY  STAT START  TIME COMMAND
-lolcat   1  0.0  0.0   1088     4 ?    Ss   10:00  0:00 /sbin/docker-init -- node index.js
-lolcat   7  0.3  0.5 600000 45000 ?    Sl   10:00  0:00 node index.js
-lolcat  20  0.0  0.0   8000  4000 ?    Rs   10:01  0:00 ps aux
+USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+lolcat       1  0.4  0.0    816     4 ?        Ss   13:08   0:00 /sbin/docker-init -- docker-entrypoint.sh node index.js
+lolcat       7  1.8  0.4 464248 40056 ?        Sl   13:08   0:00 node index.js
+lolcat      15 25.0  0.0   8164  3652 ?        Rs   13:08   0:00 ps aux
 ```
 
 | Column | Meaning |
@@ -144,7 +177,8 @@ lolcat  20  0.0  0.0   8000  4000 ?    Rs   10:01  0:00 ps aux
 Things you can see in this output:
 
 - **PID 1 is `docker-init`**, not Node.js, because of `--init`. Node.js runs under it. Without `--init`, `node` is PID 1. See [Why `--init`?](#why---init).
-- **Everything runs as `lolcat`**, not `root`. See [Running as a non-root user](#running-as-a-non-root-user).
+- **`docker-entrypoint.sh`** is a small script that the `node` images run first (their `ENTRYPOINT`). It passes your `CMD` (`node index.js`) on and then hands over to it, which is why PID 7 shows only `node index.js`.
+- **Everything runs as `lolcat`**, not `root`. See [Running as a non-root user](#running-as-a-non-root-user). In App 2, this column says `node`.
 - The container runs very few processes, only the ones it needs. The `ps aux` line is the command you just ran.
 
 `docker top na` shows the same list from outside the container. It works even when the image has no `ps` command; small images such as `node:20-slim` or `alpine` variants may not include it.
@@ -167,9 +201,9 @@ Things you can see in this output:
 
 ---
 
-## The Dockerfile
+## App 1: build-a-nodejs-app
 
-A `Dockerfile` is a text file with the steps Docker follows to build an image. This project packs a small Node.js web server into an image.
+A `Dockerfile` is a text file with the steps Docker follows to build an image. This app, in the `build-a-nodejs-app/` folder, packs a small Node.js web server into an image.
 
 ```dockerfile
 FROM node:20
@@ -282,7 +316,7 @@ Use `WORKDIR` instead. It is saved in the image's settings, so every later step 
 #### More about WORKDIR
 
 - **Use absolute paths.** `WORKDIR` can be relative, but then it builds on the previous one: `WORKDIR /a` then `WORKDIR b` gives `/a/b`. An absolute path like `/home/lolcat/code` is clearer.
-- **Who owns the folder.** If `WORKDIR` creates the folder, the owner can depend on your Docker version: BuildKit (the default builder in current Docker) uses the current `USER`, here `lolcat`, while older builders use `root`. Check it with `docker exec na ls -ld /home/lolcat/code`. Here the folder is inside `/home/lolcat`, which `useradd -m` created for `lolcat`.
+- **Who owns the folder.** If `WORKDIR` creates the folder after a `USER` line, BuildKit (the default builder in Docker Desktop and current Docker) makes that user the owner. Here `ls -ld /home/lolcat/code` shows `lolcat lolcat`. The old builder (`DOCKER_BUILDKIT=0`) makes `root` the owner instead. This matters in App 2, where `npm ci` must create `node_modules` inside the `WORKDIR`.
 - **Override it at run time.** `docker run --workdir /tmp my-node-app:3` (short form `-w`) starts the container in another folder. Here that breaks the app, because `node index.js` would look for `/tmp/index.js`.
 
 ### Running as a non-root user
@@ -307,7 +341,7 @@ COPY index.js /home/node/code/index.js
 CMD [ "node", "/home/node/code/index.js"]
 ```
 
-This was the previous version of this project's Dockerfile.
+This was the previous version of App 1's Dockerfile, and [App 2](#app-2-build-a-more-complicated-nodejs-app) uses this user too.
 
 #### Create your own user (this Dockerfile)
 
@@ -374,19 +408,21 @@ docker exec na ls -l /home/lolcat/code/index.js   # owner and group: lolcat lolc
 docker exec na ls -ld /home/lolcat/code           # the code folder that WORKDIR created
 ```
 
-Now `lolcat` owns `index.js` and can change it. This server only reads its own file, so it works either way. Ownership starts to matter when the app writes files, for example logs, uploads or a `node_modules` folder that `npm install` creates.
+Now `lolcat` owns `index.js` and can change it. This server only reads its own file, so it works either way. Ownership starts to matter when the app writes files, for example logs, uploads or a `node_modules` folder that `npm ci` creates, as in [App 2](#app-2-build-a-more-complicated-nodejs-app).
 
 **Note:** `--chown` only works with user and group names that exist in the image, so `RUN useradd` must come before this `COPY`. It also only works for Linux containers.
 
 ### Build the image
 
-From the project folder (where the `Dockerfile` is), run:
+Go into the app's folder (where its `Dockerfile` is) and build:
 
 ```sh
+cd build-a-nodejs-app
 docker build . -t my-node-app:3
 ```
 
 - `.` is the build context: the folder Docker sends to the build. Docker looks for the `Dockerfile` here, and `COPY` can only copy files from this folder.
+- You can also build from the project root by giving the folder instead of `.`: `docker build build-a-nodejs-app -t my-node-app:3`.
 - `-t my-node-app:3` gives the image a name (`my-node-app`) and a tag (`3`). Tags are often version numbers, so each new build can get a new tag.
 
 If you leave out the tag (`-t my-node-app`), Docker uses the tag `latest`.
@@ -461,3 +497,165 @@ docker run my-node:version     # prints "hi omg lol", then the container stops
 ```
 
 `node -e` runs the JavaScript given as a string. Because the script ends right away, the container stops too. A container runs only as long as its main process runs, which is why the web server version keeps running until you stop it.
+
+---
+
+## App 2: build-a-more-complicated-nodejs-app
+
+App 1 used only Node's built-in modules. Real apps use packages from npm, so the image must install them during the build. This app, in the `build-a-more-complicated-nodejs-app/` folder, uses the [Fastify](https://fastify.dev) web framework.
+
+```dockerfile
+FROM node:20
+
+USER node
+
+WORKDIR /home/node/code
+
+COPY --chown=node package*.json ./
+
+RUN npm ci
+
+COPY --chown=node . .
+
+CMD [ "node", "index.js"]
+```
+
+### The app: Fastify
+
+```js
+// this is the sample app from fastify.dev
+
+// Require the framework and instantiate it
+const fastify = require("fastify")({ logger: true });
+
+// Declare a route
+fastify.get("/", function handler(request, reply) {
+  reply.send({ hello: "world" });
+});
+
+// Run the server!
+fastify.listen({ port: 8080, host: "0.0.0.0" }, (err) => {
+  if (err) {
+    fastify.log.error(err);
+    process.exit(1);
+  }
+});
+```
+
+- `require("fastify")` loads Fastify from `node_modules`, so it must be installed first. `package.json` lists it as a dependency (`"fastify": "^5.12.7"`), and `package-lock.json` records the exact versions of Fastify and everything it needs.
+- `{ logger: true }` turns on Fastify's logger. It prints one line of JSON for each event, for example when the server starts and when each request comes in and is answered.
+- `fastify.get("/", ...)` adds a route: a `GET` request to `/` gets the JSON reply `{"hello":"world"}`.
+- `fastify.listen({ port: 8080, host: "0.0.0.0" })` starts the server on port **8080**, on all network interfaces. See [Why host 0.0.0.0?](#why-host-0000).
+- If the server cannot start (for example, the port is already in use), it logs the error and exits with code `1`.
+
+### How this Dockerfile works
+
+- `FROM node:20`: the same base image as App 1.
+- `USER node`: uses the `node` user that the image already has, instead of creating one. See [Option 1: the built-in node user](#option-1-the-built-in-node-user).
+- `WORKDIR /home/node/code`: creates the app folder, owned by `node`, and makes it the current directory. See [Working directory: WORKDIR](#working-directory-workdir).
+- `COPY --chown=node package*.json ./`: copies **only** `package.json` and `package-lock.json` (`*` matches anything). When `COPY` has more than one source, the destination must be a folder ending in `/`, so it is `./` instead of `.`.
+- `RUN npm ci`: installs the dependencies into `/home/node/code/node_modules`. It runs as `node`, so `node` owns `node_modules`. See [Installing dependencies: npm ci](#installing-dependencies-npm-ci).
+- `COPY --chown=node . .`: copies the rest of the app folder (the whole build context, except what `.dockerignore` leaves out) into the `WORKDIR`.
+- `CMD [ "node", "index.js"]`: starts the server.
+
+`npm ci` can create `node_modules` only because `node` owns the `WORKDIR` folder. If `root` owned it, `npm ci` would fail with a permission error (`EACCES`).
+
+### Installing dependencies: npm ci
+
+`npm ci` ("clean install") is the npm command made for builds and automated setups:
+
+| | `npm ci` | `npm install` |
+| --- | --- | --- |
+| Needs `package-lock.json` | Yes. It fails without one. | No. It creates one if missing. |
+| Versions | Installs exactly the versions in `package-lock.json`. | Can install newer versions allowed by `package.json` (like `^5.12.7`) and update the lock file. |
+| If `package.json` and the lock file disagree | Fails with an error. | Updates the lock file. |
+| Existing `node_modules` | Deletes it first. | Updates it. |
+
+With `npm ci`, every build installs the same versions you tested with on your machine. Use `npm install` on your machine when you add or update packages, and commit the updated `package-lock.json`.
+
+### Faster builds: copy package files first
+
+The Dockerfile copies the app in **two** steps on purpose:
+
+```dockerfile
+COPY --chown=node package*.json ./   # 1. only the dependency list
+RUN npm ci                           # 2. install (slow)
+COPY --chown=node . .                # 3. the rest of the code
+```
+
+Docker reuses a cached step until something it depends on changes. You edit `index.js` much more often than you change dependencies:
+
+- **You edit `index.js`:** steps 1 and 2 show `CACHED`, and only step 3 runs again. The build takes a second or two.
+- **You change `package.json` or `package-lock.json`:** step 1 changes, so `npm ci` runs again.
+
+If the Dockerfile copied everything with one `COPY . .` before `RUN npm ci`, any change to any file would run `npm ci` again, and every build would download all packages.
+
+### Leaving files out: .dockerignore
+
+`.dockerignore` lists files and folders that Docker does **not** send to the build, like `.gitignore` does for git:
+
+```
+node_modules/
+.git/
+```
+
+- **`node_modules/`:** If you ran `npm install` on your machine, you have a local `node_modules` folder. Without this line, `COPY . .` would copy it over the one that `npm ci` just installed in the image. Your local copy was made for macOS, while the container runs Linux, so packages with native code could break. It also makes the build context much bigger and slower to send.
+- **`.git/`:** The git history is not needed to run the app.
+
+`COPY . .` copies everything else, so the image also gets the `Dockerfile` and `.dockerignore` itself. They are harmless, but you can add them to `.dockerignore` to keep the image clean.
+
+### Build and run the Fastify app
+
+```sh
+cd build-a-more-complicated-nodejs-app
+docker build . -t my-fastify-app:1
+docker run --init --publish 8080:8080 --rm --name fa my-fastify-app:1
+```
+
+The flags are the same as in [Run the web server](#run-the-web-server). This time, the port is `8080`, because that is the port the app listens on.
+
+The logger prints JSON lines like these:
+
+```
+{"level":30,"time":1793279323175,"pid":7,"hostname":"d1e3da1794af","msg":"Server listening at http://127.0.0.1:8080"}
+{"level":30,"time":1793279323175,"pid":7,"hostname":"d1e3da1794af","msg":"Server listening at http://172.17.0.2:8080"}
+```
+
+- `level` `30` means `info`.
+- `pid` `7` is the Node.js process. It is not `1`, because of `--init`.
+- `hostname` is the container ID.
+- The two `listening` lines show the two addresses inside the container: `127.0.0.1` (the container itself) and `172.17.0.2` (the container's address on the Docker network).
+
+Open <http://localhost:8080>, or run:
+
+```sh
+curl localhost:8080      # {"hello":"world"}
+```
+
+Each request adds an `incoming request` line and a `request completed` line to the log. Stop the server with `Ctrl+C` or `docker stop fa`.
+
+### Why host 0.0.0.0?
+
+`host` decides which network addresses the server accepts connections on:
+
+| `host` | Accepts connections from |
+| --- | --- |
+| `localhost` or `127.0.0.1` | Only the container itself. |
+| `0.0.0.0` | All network interfaces, including the Docker network. |
+
+With `--publish`, Docker sends your request to the container's address on the Docker network (`172.17.0.2` above), **not** to its `localhost`. Fastify listens only on `localhost` by default, so without `host: "0.0.0.0"`, the published port does not work and <http://localhost:8080> fails to connect.
+
+App 1 did not need this, because Node's `http` `.listen(3000)` listens on all addresses by default.
+
+### App 1 and App 2 compared
+
+| | App 1 | App 2 |
+| --- | --- | --- |
+| Framework | Node's built-in `http` | Fastify, from npm |
+| Dependencies | None | `package.json` and `package-lock.json`, installed with `npm ci` |
+| User | `lolcat`, created with `useradd` | `node`, already in the image |
+| What is copied | `index.js` only | Package files first, then the whole folder |
+| `.dockerignore` | Not needed | Leaves out `node_modules/` and `.git/` |
+| Port | `3000` | `8080`, on host `0.0.0.0` |
+| Reply | `omg hi` (text) | `{"hello":"world"}` (JSON) |
+| Logs | Plain text with `console.log` | JSON lines from Fastify's logger |
