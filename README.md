@@ -56,6 +56,15 @@
    - [Problem 2: no .dockerignore](#problem-2-no-dockerignore)
    - [Distroless compared with the other apps](#distroless-compared-with-the-other-apps)
    - [When to use distroless](#when-to-use-distroless)
+8. [App 6: static-asset-project](#app-6-static-asset-project)
+   - [The app: an Astro website](#the-app-an-astro-website)
+   - [How the static site Dockerfile works](#how-the-static-site-dockerfile-works)
+   - [What is nginx?](#what-is-nginx)
+   - [Build and run the static site](#build-and-run-the-static-site)
+   - [What is inside the final image](#what-is-inside-the-final-image)
+   - [Your Dockerfile and solution.Dockerfile](#your-dockerfile-and-solutiondockerfile)
+   - [Improving the static site build](#improving-the-static-site-build)
+   - [When to serve static files with nginx](#when-to-serve-static-files-with-nginx)
 
 ---
 
@@ -88,11 +97,19 @@ my_project/
 │   ├── index.js
 │   ├── package.json
 │   └── package-lock.json
-└── distroless/                          # App 5: install on Debian, run on distroless
+├── distroless/                          # App 5: install on Debian, run on distroless
+│   ├── Dockerfile
+│   ├── index.js
+│   ├── package.json
+│   └── package-lock.json
+└── static-asset-project/                # App 6: build a website with Node.js, serve it with nginx
     ├── Dockerfile
-    ├── index.js
+    ├── solution.Dockerfile
+    ├── astro.config.mjs, tailwind.config.mjs, tsconfig.json
     ├── package.json
-    └── package-lock.json
+    ├── package-lock.json
+    ├── public/                          # files copied as they are (favicon.svg)
+    └── src/                             # pages, layouts and components
 ```
 
 `node_modules/` is not committed (see `.gitignore`). In App 2 to App 5, the image installs its own copy during the build.
@@ -1289,3 +1306,204 @@ Measured on this project, with the same Fastify app:
 **Use distroless when** the app is going to production, you already use a multi-stage build, and security matters more than easy debugging. Use the `:nonroot` image.
 
 **Use Alpine or `node:20-slim` when** you need a shell to debug or run scripts in the container, or the app needs extra system packages at run time.
+
+---
+
+## App 6: static-asset-project
+
+Apps 1 to 5 were Node.js **servers**: Node.js had to run inside the container to answer each request. This app is a **static website**. Node.js is needed only to **build** it into plain HTML, CSS and JavaScript files. After that, any web server can send those files, and Node.js is not needed at all.
+
+```dockerfile
+# build step
+FROM node:20 AS node-builder
+WORKDIR /app
+COPY . .
+RUN npm ci
+RUN npm run build
+
+#production step
+FROM nginx:alpine
+COPY --from=node-builder /app/dist /usr/share/nginx/html
+```
+
+This is the multi-stage idea from [App 4](#app-4-multi-stage-builds) taken all the way: the final image has **no Node.js**, only a web server and the built files.
+
+### The app: an Astro website
+
+The folder is the "basics" starter project of [Astro](https://astro.build), a framework for building websites:
+
+- `src/pages/index.astro` is the home page. `src/layouts/` and `src/components/` hold the parts it is built from.
+- `public/` holds files that are copied as they are, like `favicon.svg`.
+- `astro.config.mjs` turns on React and [Tailwind CSS](https://tailwindcss.com) (a CSS framework). `tailwind.config.mjs` and `tsconfig.json` configure Tailwind and TypeScript.
+- `package.json` lists Astro, React, Tailwind and TypeScript, with about 400 packages in `node_modules` (198 MB).
+
+The `build` script in `package.json` is:
+
+```json
+"build": "astro check && astro build"
+```
+
+- `astro check` checks the code for TypeScript errors. The build stops if it finds any.
+- `astro build` turns the project into a static website in the `dist/` folder.
+
+The result is small: `dist/` is only **155 kB** (`index.html`, `favicon.svg` and an `_astro/` folder with the CSS and JavaScript). That is what goes into the final image.
+
+### How the static site Dockerfile works
+
+#### Stage 1: build (`node-builder`)
+
+- `FROM node:20 AS node-builder` uses the full Debian Node.js image, which has everything the build needs.
+- `WORKDIR /app` creates `/app` and makes it the current directory.
+- `COPY . .` copies the whole project folder. See [Improving the static site build](#improving-the-static-site-build) for two problems with copying everything at this point.
+- `RUN npm ci` installs the dependencies.
+- `RUN npm run build` runs the `build` script, which creates `/app/dist`.
+
+This stage has no `USER` and runs as `root`. As in App 5, that is fine, because none of it runs in the final container.
+
+#### Stage 2: production
+
+- `FROM nginx:alpine` uses the official [nginx](#what-is-nginx) image, built on Alpine.
+- `COPY --from=node-builder /app/dist /usr/share/nginx/html` copies the built website into the folder that nginx serves files from.
+
+There is **no `CMD`**. The `nginx:alpine` image already has one (`nginx -g daemon off;`), and this stage keeps it. It also keeps the image's `ENTRYPOINT` (`/docker-entrypoint.sh`) and its `EXPOSE 80`.
+
+There is no `--chown` either. nginx only **reads** these files, and they are readable by everyone, so `root` can own them.
+
+### What is nginx?
+
+[nginx](https://nginx.org) ("engine x") is a web server. It is very fast at sending files, and it is often also used in front of other apps (as a reverse proxy or load balancer).
+
+The `nginx` image is set up to work without any configuration:
+
+| Setting | Value |
+| --- | --- |
+| Folder it serves files from | `/usr/share/nginx/html` |
+| Port it listens on | `80` (the image declares `EXPOSE 80`) |
+| Default file for a folder | `index.html`, so `/` returns `/usr/share/nginx/html/index.html` |
+| Command | `nginx -g daemon off;` |
+
+`daemon off;` keeps nginx in the foreground. Normally nginx starts and moves itself into the background, but in a container the main process must keep running, or the container stops (see [Earlier version: a one-line script](#earlier-version-a-one-line-script)).
+
+### Build and run the static site
+
+```sh
+cd static-asset-project
+docker build . -t my-static-site
+docker run --publish 8080:80 --rm --name site my-static-site
+```
+
+- `--publish 8080:80` maps port `8080` on your machine to nginx's port `80` in the container. Open <http://localhost:8080> to see the "Welcome to Astro." page.
+- `--init` is not needed. nginx is made to run as PID 1 and handles `Ctrl+C` and `docker stop` itself, so `docker stop site` stops it in about a second.
+
+The build takes about 25 seconds the first time: `npm ci` takes about 12 seconds, and `npm run build` about 6. The build output shows `astro check` reporting `0 errors`, then `astro build` building the pages.
+
+nginx logs one line per request, in the standard web server format:
+
+```
+172.17.0.1 - - [29/Oct/2026:18:30:23 +0000] "GET /favicon.svg HTTP/1.1" 200 749 "-" "curl/8.7.1" "-"
+```
+
+A file that does not exist returns `404` and also logs an `[error]` line.
+
+### What is inside the final image
+
+| | |
+| --- | --- |
+| Image size | **62.8 MB**, of which the website is 155 kB |
+| Build stage size (thrown away) | 1.51 GB |
+| Node.js | Not installed |
+| nginx version | 1.31.8 |
+
+`ls -la /usr/share/nginx/html` in the container shows the built site, plus `50x.html`, the error page that comes with nginx:
+
+```
+50x.html
+_astro/
+favicon.svg
+index.html
+```
+
+`docker exec site ps aux` shows how nginx runs:
+
+```
+PID   USER     TIME  COMMAND
+    1 root      0:00 nginx: master process nginx -g daemon off;
+   30 nginx     0:00 nginx: worker process
+   31 nginx     0:00 nginx: worker process
+   ...
+```
+
+- The **master** process runs as `root`. It reads the configuration, opens port 80 and starts the workers.
+- The **worker** processes answer the requests. They run as the `nginx` user, not `root`. There is one per CPU core.
+
+So nginx does its own [non-root](#running-as-a-non-root-user) setup: the processes that handle requests from the internet do not run as `root`, even without a `USER` line.
+
+### Your Dockerfile and solution.Dockerfile
+
+The folder also has `solution.Dockerfile`. Its build stage is the same. The only difference is the production base image:
+
+```dockerfile
+# you could totally use nginx:alpine here too
+FROM nginx:latest
+```
+
+| | `Dockerfile` (`nginx:alpine`) | `solution.Dockerfile` (`nginx:latest`) |
+| --- | --- | --- |
+| Base | Alpine | Debian 13 |
+| nginx version | 1.31.8 | 1.31.8 |
+| Image size | **62.8 MB** | 183 MB |
+
+Both serve the same website with the same nginx version. The Alpine version is about 3 times smaller. nginx does not need any native npm modules, so Alpine's [musl differences](#things-that-work-differently-on-alpine) do not matter here.
+
+To build the other file, give its name with `-f`:
+
+```sh
+docker build . -f solution.Dockerfile -t my-static-site:debian
+```
+
+### Improving the static site build
+
+The Dockerfile works, but it has the same two problems that [App 2](#app-2-build-a-more-complicated-nodejs-app) solved:
+
+1. **No `.dockerignore`.** `COPY . .` copies the whole folder, including your local `node_modules` (198 MB), and Docker has to send all of it to the build. The build still works, because `npm ci` deletes `node_modules` first and installs it again, but sending it is slow. Old `dist/` and `.astro/` folders are copied too.
+2. **`COPY . .` comes before `RUN npm ci`.** When you change any file, even one line of `index.astro`, the `COPY . .` step changes, so `npm ci` runs again and downloads about 400 packages. See [Faster builds: copy package files first](#faster-builds-copy-package-files-first).
+
+Add a `.dockerignore` (the same folders as the project's `.gitignore`):
+
+```
+node_modules/
+dist/
+.astro/
+.git/
+```
+
+And copy the package files first:
+
+```dockerfile
+FROM node:20 AS node-builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=node-builder /app/dist /usr/share/nginx/html
+```
+
+With these two changes, Docker no longer sends `node_modules` to the build, and when only the website's code changes, `npm ci` stays `CACHED`.
+
+### When to serve static files with nginx
+
+**This setup works for** any project that builds to plain files: Astro, Vite, React (Create React App), Vue, Angular, Svelte, Hugo, a documentation site, or hand-written HTML. If the build output is a folder of HTML, CSS and JavaScript, you can serve it with nginx.
+
+**Benefits:**
+
+- **Small image.** 62.8 MB, with no Node.js and no `node_modules`.
+- **Fast.** nginx is built to send files, and it does it faster and with less memory than a Node.js server.
+- **Safer.** No Node.js, npm or app code runs in the container, so there is less that can have security holes. The workers do not run as `root`.
+- **No server code.** You do not write or maintain a server like `index.js` in Apps 1 to 5.
+
+**It does not work when** the site needs code on the server for each request, for example a login, a database, an API, or pages rendered on the server (Astro's server mode, Next.js server features). Then you need a Node.js server, as in Apps 1 to 5. nginx is often still used **in front of** it.
+
+To change how nginx behaves (for example, single-page apps that need every path to return `index.html`, caching headers, or redirects), copy your own configuration file into `/etc/nginx/conf.d/default.conf`.
