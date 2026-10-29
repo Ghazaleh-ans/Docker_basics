@@ -28,6 +28,13 @@
    - [Build and run the Fastify app](#build-and-run-the-fastify-app)
    - [Why host 0.0.0.0?](#why-host-0000)
    - [App 1 and App 2 compared](#app-1-and-app-2-compared)
+5. [App 3: alpine-linux](#app-3-alpine-linux)
+   - [What is Alpine Linux?](#what-is-alpine-linux)
+   - [Alpine and Debian compared](#alpine-and-debian-compared)
+   - [Benefits of Alpine](#benefits-of-alpine)
+   - [Things that work differently on Alpine](#things-that-work-differently-on-alpine)
+   - [When to use Alpine, slim or the full image](#when-to-use-alpine-slim-or-the-full-image)
+   - [Build and run the Alpine app](#build-and-run-the-alpine-app)
 
 ---
 
@@ -42,7 +49,13 @@ my_project/
 ├── build-a-nodejs-app/                  # App 1: web server with no dependencies
 │   ├── Dockerfile
 │   └── index.js
-└── build-a-more-complicated-nodejs-app/ # App 2: Fastify server with npm dependencies
+├── build-a-more-complicated-nodejs-app/ # App 2: Fastify server with npm dependencies
+│   ├── .dockerignore
+│   ├── Dockerfile
+│   ├── index.js
+│   ├── package.json
+│   └── package-lock.json
+└── alpine-linux/                        # App 3: App 2 on a small Alpine Linux base image
     ├── .dockerignore
     ├── Dockerfile
     ├── index.js
@@ -50,7 +63,7 @@ my_project/
     └── package-lock.json
 ```
 
-`node_modules/` is not committed (see `.gitignore`). In App 2, the image installs its own copy during the build.
+`node_modules/` is not committed (see `.gitignore`). In App 2 and App 3, the image installs its own copy during the build.
 
 ---
 
@@ -105,6 +118,7 @@ Use `-it` when you want to type into the container. `-i` alone has no prompt, an
 ```sh
 docker run -it node:20          # opens the Node.js REPL
 docker run -it node:20 bash     # opens a bash shell instead of the default command
+docker run -it node:20-alpine sh  # Alpine images have no bash, so use sh
 ```
 
 Type `exit` (or press `Ctrl+D`) to leave. The container stops when you exit.
@@ -181,7 +195,17 @@ Things you can see in this output:
 - **Everything runs as `lolcat`**, not `root`. See [Running as a non-root user](#running-as-a-non-root-user). In App 2, this column says `node`.
 - The container runs very few processes, only the ones it needs. The `ps aux` line is the command you just ran.
 
-`docker top na` shows the same list from outside the container. It works even when the image has no `ps` command; small images such as `node:20-slim` or `alpine` variants may not include it.
+`docker top na` shows the same list from outside the container. It works even when the image has no `ps` command, as in `node:20-slim`.
+
+On Alpine images, `ps` is the small BusyBox version. It ignores `aux` and always shows only four columns:
+
+```
+PID   USER     TIME  COMMAND
+    1 node      0:00 /sbin/docker-init -- docker-entrypoint.sh node index.js
+    8 node      0:00 node index.js
+```
+
+See [App 3: alpine-linux](#app-3-alpine-linux).
 
 ### Cleaning up
 
@@ -367,7 +391,7 @@ The order matters:
 
 Each user has a number (UID). The `node` user already has UID `1000`, so `lolcat` gets the next free one, `1001`.
 
-**Note:** `useradd` is for Debian and Ubuntu based images like `node:20`. Alpine images (`node:20-alpine`) use `adduser` instead.
+**Note:** `useradd` is for Debian and Ubuntu based images like `node:20`. Alpine images (`node:20-alpine`) do not have it (`useradd: not found`). Use `adduser` instead: `RUN adduser -D lolcat` creates `lolcat` with the home folder `/home/lolcat` and no password (`-D`). Its default shell is `/bin/sh`, because Alpine has no bash. See [App 3: alpine-linux](#app-3-alpine-linux).
 
 #### Check which user runs the app
 
@@ -659,3 +683,120 @@ App 1 did not need this, because Node's `http` `.listen(3000)` listens on all ad
 | Port | `3000` | `8080`, on host `0.0.0.0` |
 | Reply | `omg hi` (text) | `{"hello":"world"}` (JSON) |
 | Logs | Plain text with `console.log` | JSON lines from Fastify's logger |
+
+---
+
+## App 3: alpine-linux
+
+This app, in the `alpine-linux/` folder, is App 2 with **one** change: the base image.
+
+```dockerfile
+FROM node:20-alpine
+
+USER node
+
+WORKDIR /home/node/code
+
+COPY --chown=node package*.json ./
+
+RUN npm ci
+
+COPY --chown=node . .
+
+CMD [ "node", "index.js"]
+```
+
+`index.js`, `package.json`, `package-lock.json` and `.dockerignore` are the same as in App 2 (only the `name` field differs), so everything in [App 2](#app-2-build-a-more-complicated-nodejs-app) applies here too. The `node` user also exists in the Alpine image, with the same UID (`1000`), so `USER node` and `--chown=node` work without changes.
+
+### What is Alpine Linux?
+
+Every image is built on a Linux distribution. `node:20` is built on **Debian** (version 12, "bookworm"). `node:20-alpine` is built on **Alpine Linux**, a distribution made to be as small and simple as possible. Alpine is built from three small parts:
+
+- **musl** instead of glibc, as the C library: the low-level code that almost every program, including Node.js, uses to talk to the system.
+- **BusyBox** instead of the GNU tools: one small program that provides `sh`, `ls`, `ps`, `cp` and most other basic commands.
+- **apk** instead of `apt-get`, as the package manager.
+
+The Node.js version is the same in both. In these images, both run Node.js `v20.20.2`.
+
+### Alpine and Debian compared
+
+Measured on this project:
+
+| | `node:20` (Debian) | `node:20-slim` (Debian) | `node:20-alpine` (Alpine) |
+| --- | --- | --- | --- |
+| Base image size | 1.1 GB | 222 MB | **136 MB** |
+| This app's image size | 1.11 GB (App 2) | | **146 MB** (App 3) |
+| Installed OS packages | 413 | | 18 |
+| C library | glibc | glibc | musl |
+| Shell | `bash` (and `sh`) | `bash` (and `sh`) | `sh` only (no `bash`) |
+| Package manager | `apt-get` | `apt-get` | `apk` |
+| Add a user | `useradd` | `useradd` | `adduser` |
+| Extra tools included | `git`, `curl`, `python3`, `make`, `gcc` and more | Almost none, not even `ps` | Almost none (`wget`, BusyBox tools) |
+| Memory used by the running app | about 21 MiB | | about 20 MiB |
+
+The app itself, its dependencies and Fastify add only about 10 MB in both cases. The difference is almost all in the base image.
+
+`node:20-slim` is a third option: Debian (glibc, `apt-get`, `bash`), but with most extra packages removed.
+
+### Benefits of Alpine
+
+- **Much smaller images.** 146 MB instead of 1.11 GB, about 8 times smaller. They use less disk space on your machine and on servers.
+- **Faster pulls and pushes.** Uploading to a registry and downloading on a server or in CI takes much less time. This matters when you deploy often or start containers on many machines.
+- **Smaller attack surface.** 18 packages instead of 413. Fewer programs mean fewer possible security holes, and fewer warnings when you scan the image with a security scanner (for example `docker scout cves`).
+- **Fewer tools for an attacker.** If someone breaks into the container, there is no `bash`, `git`, `curl` or compiler to help them.
+- **Nothing else changes for this app.** Fastify is plain JavaScript, so it runs on Alpine without changes.
+
+Alpine does **not** make the app faster or use less memory: the running app used about 20 MiB in both images. The benefit is the size of the image, not the speed of the app.
+
+### Things that work differently on Alpine
+
+- **No `bash`.** `docker exec -it fa bash` fails. Use `sh` instead: `docker exec -it fa sh`. If you need bash, install it with `RUN apk add --no-cache bash` (as `root`, before `USER`).
+- **No `useradd`.** Use `adduser -D <name>`. See the note in [Create your own user](#create-your-own-user-this-dockerfile).
+- **`apk` instead of `apt-get`.** For example, `RUN apk add --no-cache curl` instead of `RUN apt-get update && apt-get install -y curl`. `--no-cache` stops apk from keeping its package list in the image.
+- **BusyBox commands have fewer options.** For example, `ps aux` shows only `PID`, `USER`, `TIME` and `COMMAND`. See [ps aux](#processes-inside-a-container-ps-aux).
+- **musl instead of glibc.** This only matters for npm packages with **native code** (C or C++ compiled for the system, such as `bcrypt`, `sharp` or some database drivers):
+  - If the package ships a ready-made build for musl, it works.
+  - If it does not, `npm ci` has to compile it, and Alpine has no compiler. You need `RUN apk add --no-cache python3 make g++` first, which makes the build slower and the image bigger.
+  - Some programs exist only for glibc and do not run on Alpine at all, for example the Chrome that Puppeteer downloads.
+- **Small behaviour differences.** musl handles some things, like DNS lookups and memory allocation, a little differently from glibc. It rarely matters, but it can cause hard-to-find bugs that only happen on Alpine.
+
+### When to use Alpine, slim or the full image
+
+**Use Alpine (`node:20-alpine`) when:**
+
+- Your dependencies are plain JavaScript, or all have musl builds, like this Fastify app.
+- You build images for production, CI or deployments, where size and pull time matter.
+- You want the smallest attack surface.
+
+**Use slim (`node:20-slim`) when:**
+
+- You want a small image, but a dependency needs glibc or does not work on Alpine.
+- You want Debian's `apt-get` and `bash`, with most of the size savings.
+
+**Use the full image (`node:20`) when:**
+
+- You are learning or debugging and want tools like `git`, `curl`, `bash` and `ps` ready to use.
+- `npm ci` needs to compile native modules, and you do not want to install build tools yourself.
+- Image size does not matter, for example for a quick local experiment.
+
+A common setup is to start with `node:20` while developing, then switch to `node:20-alpine` (or `node:20-slim` if something breaks) for the image you deploy. Always run and test the app on the same base image you deploy with.
+
+### Build and run the Alpine app
+
+```sh
+cd alpine-linux
+docker build . -t my-fastify-app:alpine
+docker run --init --publish 8080:8080 --rm --name fa my-fastify-app:alpine
+```
+
+The tag `alpine` keeps it apart from the Debian build of the same app. Compare the two sizes with:
+
+```sh
+docker image ls my-fastify-app
+```
+
+The app works exactly like App 2: <http://localhost:8080> returns `{"hello":"world"}`, and the logs are the same JSON lines. For a shell inside the container, use `sh`:
+
+```sh
+docker exec -it fa sh
+```
