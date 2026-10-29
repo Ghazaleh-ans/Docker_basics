@@ -35,6 +35,9 @@
    - [Things that work differently on Alpine](#things-that-work-differently-on-alpine)
    - [When to use Alpine, slim or the full image](#when-to-use-alpine-slim-or-the-full-image)
    - [Build and run the Alpine app](#build-and-run-the-alpine-app)
+   - [Version 2: install Node.js on plain Alpine](#version-2-install-nodejs-on-plain-alpine)
+   - [Version 1 and Version 2 compared](#version-1-and-version-2-compared)
+   - [Which version to use](#which-version-to-use)
 
 ---
 
@@ -688,7 +691,12 @@ App 1 did not need this, because Node's `http` `.listen(3000)` listens on all ad
 
 ## App 3: alpine-linux
 
-This app, in the `alpine-linux/` folder, is App 2 with **one** change: the base image.
+This app, in the `alpine-linux/` folder, runs App 2 on Alpine Linux. It has two versions:
+
+- **Version 1** (this section, up to [Build and run the Alpine app](#build-and-run-the-alpine-app)): App 2 with **one** change, the base image `node:20-alpine`.
+- **Version 2** (the current `Dockerfile` in the folder): starts from plain `alpine:3.19` and installs Node.js itself. See [Version 2: install Node.js on plain Alpine](#version-2-install-nodejs-on-plain-alpine).
+
+Version 1:
 
 ```dockerfile
 FROM node:20-alpine
@@ -799,4 +807,107 @@ The app works exactly like App 2: <http://localhost:8080> returns `{"hello":"wor
 
 ```sh
 docker exec -it fa sh
+```
+
+**Note:** These commands build whatever `Dockerfile` is in the folder, and that is now Version 2.
+
+### Version 2: install Node.js on plain Alpine
+
+Version 2 does not use a ready-made Node.js image. It starts from plain Alpine Linux and installs Node.js and npm with `apk`:
+
+```dockerfile
+FROM alpine:3.19
+
+RUN apk add --update nodejs npm
+
+RUN addgroup -S node && adduser -S node -G node
+
+USER node
+
+WORKDIR /home/node/code
+
+COPY --chown=node package*.json ./
+
+RUN npm ci
+
+COPY --chown=node . .
+
+CMD [ "node", "index.js"]
+```
+
+Only the first three instructions are new. From `USER node` down, it is the same as Version 1 and App 2.
+
+#### How the new lines work
+
+- `FROM alpine:3.19` uses the official Alpine Linux image, version 3.19. It is only **7.7 MB** and has no Node.js, npm or `node` user.
+- `RUN apk add --update nodejs npm` installs Node.js and npm from Alpine's own package repository:
+  - `--update` downloads the latest package list first, so apk knows which versions are available.
+  - `nodejs` and `npm` are two separate packages in Alpine, so you need both. Without `npm`, `RUN npm ci` fails.
+  - The version is the one Alpine 3.19 ships: Node.js **v20.15.1** and npm **10.2.5**. You cannot pick another patch version.
+  - apk installs a few more packages that Node.js needs (for example ICU for languages and dates, and OpenSSL), so the image has 27 packages instead of 18.
+- `RUN addgroup -S node && adduser -S node -G node` creates the `node` user, because plain Alpine does not have it:
+  - `addgroup -S node` creates a **system** group called `node`.
+  - `adduser -S node` creates a **system** user called `node`: it has no password, its login shell is `/sbin/nologin` (nobody can log in as it), and its home folder is `/home/node`. System users get a low UID, here `100`, instead of `1000`.
+  - `-G node` puts the user in the `node` group.
+  - `&&` runs the second command only if the first one succeeds. Both are in one `RUN`, so they make one layer.
+
+`node` is just a name here. It matches the user in the official images, so the rest of the Dockerfile works without changes.
+
+#### Things that are different in Version 2
+
+- **No `docker-entrypoint.sh`.** Plain Alpine has no `ENTRYPOINT`, so Docker runs the `CMD` directly. `ps aux` shows `/sbin/docker-init -- node index.js` instead of `/sbin/docker-init -- docker-entrypoint.sh node index.js`.
+- **Different user IDs.** `id` shows `uid=100(node) gid=101(node)`, not `1000`. This matters when you share files between your machine and the container (for example with `--volume`), because file permissions use the number, not the name.
+- **apk's package list stays in the image.** `--update` saves the downloaded list in `/var/cache/apk` (2.1 MB here). Use `--no-cache` instead: it downloads the list, installs and leaves nothing behind:
+
+  ```dockerfile
+  RUN apk add --no-cache nodejs npm
+  ```
+
+### Version 1 and Version 2 compared
+
+Measured on this project:
+
+| | Version 1: `node:20-alpine` | Version 2: `alpine:3.19` + apk |
+| --- | --- | --- |
+| Base image size | 136 MB | 7.7 MB (before Node.js is installed) |
+| This app's image size | 146 MB | **82.4 MB** |
+| Node.js version | v20.20.2 | v20.15.1 |
+| npm version | 10.8.2 | 10.2.5 |
+| Who builds Node.js | The Node.js Docker team | The Alpine Linux team |
+| Choosing the Node.js version | Any version, by tag (`node:20.20.2-alpine`, `node:22-alpine`, ...) | Only the version the Alpine release ships |
+| Installed packages | 18 | 27 |
+| `node` user | Built in, UID `1000`, shell `/bin/sh` | Created by you, UID `100`, shell `/sbin/nologin` |
+| `ENTRYPOINT` | `docker-entrypoint.sh` | None |
+| Lines in the Dockerfile | 7 instructions | 9 instructions |
+| Memory used by the running app | about 20 MiB | about 20 MiB |
+
+Both versions return `{"hello":"world"}` and log the same JSON lines.
+
+**Why is Version 2 smaller?** The official image includes extra tools such as `yarn`, and Node.js is built to carry its own copies of some libraries. Alpine's `nodejs` package uses the libraries shared by the whole system instead, and has nothing extra.
+
+### Which version to use
+
+**Version 2 benefits:**
+
+- **Smallest image.** 82.4 MB instead of 146 MB, about 44% smaller, and about 13 times smaller than the Debian App 2 (1.11 GB).
+- **You control everything.** Every package in the image is one you asked for.
+- **The same pattern works for any app.** You can install Python, Go or anything else from apk the same way, on the same base image.
+
+**Version 2 drawbacks:**
+
+- **Older Node.js, chosen by Alpine.** You get the version Alpine 3.19 ships (v20.15.1), not the newest v20 release (v20.20.2). The newer releases include security fixes, and you cannot upgrade without changing the Alpine version.
+- **Alpine 3.19 is out of support.** Its security updates ended in November 2025, so its packages, including Node.js, no longer get fixes. Use a supported Alpine release, and check which Node.js version its `nodejs` package has at [pkgs.alpinelinux.org](https://pkgs.alpinelinux.org/packages?name=nodejs).
+- **More to maintain.** You write and look after the install and user lines that the official image already does for you.
+- **Different from the official image.** The UID (`100`, not `1000`) and the missing `ENTRYPOINT` can surprise people who know the official `node` images.
+
+**Use Version 1 (`node:20-alpine`) when** you want an exact Node.js version, regular security updates from the Node.js team and the least work. This is the right choice for most projects.
+
+**Use Version 2 (`alpine` + `apk`) when** image size matters most, the Node.js version from Alpine is good enough for you, and you keep the Alpine version up to date. It is also a good way to learn what the official image does for you.
+
+Build Version 2 with its own tag, so you can compare it with Version 1:
+
+```sh
+cd alpine-linux
+docker build . -t my-fastify-app:alpine-apk
+docker image ls my-fastify-app
 ```
