@@ -47,6 +47,15 @@
    - [Watch out: native modules](#watch-out-native-modules)
    - [Making it smaller and simpler](#making-it-smaller-and-simpler)
    - [When to use multi-stage builds](#when-to-use-multi-stage-builds)
+7. [App 5: distroless](#app-5-distroless)
+   - [What is distroless?](#what-is-distroless)
+   - [How the distroless Dockerfile works](#how-the-distroless-dockerfile-works)
+   - [Build and run the distroless app](#build-and-run-the-distroless-app)
+   - [Living without a shell](#living-without-a-shell)
+   - [Problem 1: the app runs as root](#problem-1-the-app-runs-as-root)
+   - [Problem 2: no .dockerignore](#problem-2-no-dockerignore)
+   - [Distroless compared with the other apps](#distroless-compared-with-the-other-apps)
+   - [When to use distroless](#when-to-use-distroless)
 
 ---
 
@@ -73,15 +82,20 @@ my_project/
 │   ├── index.js
 │   ├── package.json
 │   └── package-lock.json
-└── multi-stage-builds/                  # App 4: install on Debian, run on Alpine
-    ├── .dockerignore
+├── multi-stage-builds/                  # App 4: install on Debian, run on Alpine
+│   ├── .dockerignore
+│   ├── Dockerfile
+│   ├── index.js
+│   ├── package.json
+│   └── package-lock.json
+└── distroless/                          # App 5: install on Debian, run on distroless
     ├── Dockerfile
     ├── index.js
     ├── package.json
     └── package-lock.json
 ```
 
-`node_modules/` is not committed (see `.gitignore`). In App 2, App 3 and App 4, the image installs its own copy during the build.
+`node_modules/` is not committed (see `.gitignore`). In App 2 to App 5, the image installs its own copy during the build.
 
 ---
 
@@ -213,7 +227,7 @@ Things you can see in this output:
 - **Everything runs as `lolcat`**, not `root`. See [Running as a non-root user](#running-as-a-non-root-user). In App 2, this column says `node`.
 - The container runs very few processes, only the ones it needs. The `ps aux` line is the command you just ran.
 
-`docker top na` shows the same list from outside the container. It works even when the image has no `ps` command, as in `node:20-slim`.
+`docker top na` shows the same list from outside the container. It works even when the image has no `ps` command, as in `node:20-slim`, or no shell at all, as in [distroless](#app-5-distroless).
 
 On Alpine images, `ps` is the small BusyBox version. It ignores `aux` and always shows only four columns:
 
@@ -1088,3 +1102,190 @@ These changes are optional. They are tested on this project:
 - You want the production image to be as small and safe as possible.
 
 **A single stage is enough when** the app needs nothing at build time except `npm ci`, like this Fastify app. Then a small single-stage image gets nearly the same result with fewer lines and no risk of a system mismatch: [App 3 Version 2](#version-2-install-nodejs-on-plain-alpine) is 82.4 MB, against 80.7 MB here. [App 3 Version 1](#app-3-alpine-linux) (`node:20-alpine`, 146 MB) is bigger, but gives you an up-to-date Node.js.
+
+---
+
+## App 5: distroless
+
+This app, in the `distroless/` folder, is the same Fastify app again, with a multi-stage build like App 4. The difference is the production stage: instead of Alpine, it runs on a **distroless** image.
+
+```dockerfile
+# build stage
+FROM node:20 AS node-builder
+WORKDIR /build
+COPY package-lock.json package.json ./
+RUN npm ci
+COPY . .
+
+# runtime stage
+FROM gcr.io/distroless/nodejs20
+COPY --from=node-builder --chown=node:node /build /app
+WORKDIR /app
+CMD ["index.js"]
+```
+
+### What is distroless?
+
+[Distroless](https://github.com/GoogleContainerTools/distroless) images are made by Google. They contain **only your app's runtime** (here Node.js) and the few system files it needs, such as certificates, time zone data and `/etc/passwd`. They have **no** Linux distribution tools at all:
+
+- no shell (`sh` or `bash`)
+- no package manager (`apt-get` or `apk`)
+- no basic commands (`ls`, `cat`, `ps`, `whoami`)
+
+They are built on Debian 12, so they use **glibc**, like `node:20`, not musl like Alpine.
+
+| | Alpine (App 4's production stage) | Distroless (App 5's production stage) |
+| --- | --- | --- |
+| Based on | Alpine Linux | Debian 12, with almost everything removed |
+| C library | musl | glibc |
+| Shell and basic commands | `sh` and BusyBox | None |
+| Package manager | `apk` | None |
+| Node.js | Installed by you with `apk` (v20.15.1) | Built into the image (v20.20.2) |
+
+The idea: a container only needs to **run one program**. Everything else in the image is something an attacker could use, and something that can have security holes.
+
+### How the distroless Dockerfile works
+
+#### Stage 1: build (`node-builder`)
+
+The same as App 4, with two small differences:
+
+- There is no `RUN mkdir /build`. `WORKDIR /build` creates the folder by itself.
+- `COPY package-lock.json package.json ./` names both files instead of using `package*.json`. The result is the same.
+
+#### Stage 2: runtime
+
+- `FROM gcr.io/distroless/nodejs20` uses the distroless Node.js 20 image. It comes from Google's registry (`gcr.io`), not Docker Hub, so the image name includes the registry address. Without a tag, Docker uses `latest`.
+- `COPY --from=node-builder --chown=node:node /build /app` copies the installed app from stage 1 into `/app`. Docker creates `/app`. (`--chown=node:node` does not work here, see [Problem 1: the app runs as root](#problem-1-the-app-runs-as-root).)
+- `WORKDIR /app` makes `/app` the current directory.
+- `CMD ["index.js"]` gives only the file name, **not** `node index.js`. The distroless image already sets `ENTRYPOINT ["/nodejs/bin/node"]`, and Docker adds the `CMD` to the end of the `ENTRYPOINT`. The container runs `/nodejs/bin/node index.js`.
+
+There is no `RUN` in this stage, and there could not be: `RUN` needs a shell, and distroless has none. Everything that needs commands must happen in the build stage.
+
+#### ENTRYPOINT and CMD
+
+This is the first app in this README where the difference matters:
+
+| | What it is | Set by |
+| --- | --- | --- |
+| `ENTRYPOINT` | The program that always runs. | The distroless image: `/nodejs/bin/node` |
+| `CMD` | The default **arguments** for the `ENTRYPOINT`. You can replace them in `docker run`. | This Dockerfile: `index.js` |
+
+So `docker run more-complicated-app:distroless other.js` runs `node other.js`. If you wrote `CMD ["node", "index.js"]` here, the container would run `node node index.js` and fail, because there is no file called `node`. The `node` images use the `ENTRYPOINT` `docker-entrypoint.sh` for the same reason (see [ps aux](#processes-inside-a-container-ps-aux)).
+
+### Build and run the distroless app
+
+```sh
+cd distroless
+docker build . -t more-complicated-app:distroless
+docker run --init --publish 8080:8080 --rm --name dl more-complicated-app:distroless
+```
+
+The app works like the others: <http://localhost:8080> returns `{"hello":"world"}`, with the same JSON logs. `--init` works too, because Docker adds `docker-init` from the outside, so it does not need a shell in the image.
+
+The image is **145 MB**: about 137 MB for the distroless Node.js image and 8.35 MB for the app.
+
+`docker image ls` shows the distroless base image as created "56 years ago". This is not a mistake: distroless images are built with a fixed date (1 January 1970), so that building the same image twice gives exactly the same result.
+
+### Living without a shell
+
+With no shell, the usual ways to look inside a container fail:
+
+```sh
+docker exec -it dl sh
+# exec: "sh": executable file not found in $PATH
+```
+
+What still works:
+
+- **`docker logs dl`** shows the app's output.
+- **`docker top dl`** lists the processes from outside the container, so it does not need `ps`.
+- **Node.js itself** is in the image, so you can run JavaScript with it:
+
+  ```sh
+  docker exec dl /nodejs/bin/node -e 'console.log(process.getuid())'
+  ```
+
+- **The `:debug` images** add a BusyBox shell, for debugging only. Do not deploy them:
+
+  ```sh
+  docker run -it --rm --entrypoint sh gcr.io/distroless/nodejs20-debian12:debug
+  ```
+
+### Problem 1: the app runs as root
+
+This Dockerfile has **no `USER`**, so the app runs as `root`. `docker top dl` shows `root` in the `USER` column, and `process.getuid()` prints `0`. This undoes the work from [Running as a non-root user](#running-as-a-non-root-user).
+
+`--chown=node:node` does not help, because **distroless has no `node` user**. Its `/etc/passwd` has only three users:
+
+| User | UID | Purpose |
+| --- | --- | --- |
+| `root` | `0` | The default user. |
+| `nobody` | `65534` | A user with no rights. |
+| `nonroot` | `65532` | The normal user for running apps. |
+
+Docker did not stop with an error. The files simply ended up owned by `root` (`0:0`). You cannot create a `node` user either, because `adduser` needs a shell.
+
+**The fix:** use the `:nonroot` image, which already runs as `nonroot`, and give the files to that user:
+
+```dockerfile
+FROM gcr.io/distroless/nodejs20-debian12:nonroot
+COPY --from=node-builder --chown=nonroot:nonroot /build /app
+WORKDIR /app
+CMD ["index.js"]
+```
+
+Tested on this project: the app runs as UID `65532`, the files are owned by `65532`, and it still returns `{"hello":"world"}`. `nodejs20-debian12` is the full name of the same image, with the Debian version written out.
+
+### Problem 2: no .dockerignore
+
+The other apps have a `.dockerignore`, but this folder does not. So `COPY . .` in stage 1 copies **everything** in the folder:
+
+- Your local `node_modules` (installed on macOS) is copied **over** the one that `npm ci` just installed for Linux. This app still works, because Fastify is plain JavaScript. But any package with native code would break. See [Leaving files out: .dockerignore](#leaving-files-out-dockerignore).
+- The build sends 8.5 MB to Docker instead of a few kB, so every build starts slower.
+- The `Dockerfile` itself ends up in `/app`.
+
+**The fix:** add the same `.dockerignore` as the other apps:
+
+```
+node_modules/
+.git/
+```
+
+### Distroless compared with the other apps
+
+Measured on this project, with the same Fastify app:
+
+| | App 2 | App 4 | App 5 |
+| --- | --- | --- | --- |
+| Runs on | `node:20` (Debian) | `alpine:3.19` + apk | `gcr.io/distroless/nodejs20` |
+| Image size | 1.11 GB | 80.7 MB | 145 MB |
+| Node.js version | v20.20.2 | v20.15.1 | v20.20.2 |
+| Built and run on the same system | Yes | No (Debian, then Alpine) | Yes (both Debian 12, glibc) |
+| Shell | `bash` | `sh` | None |
+| Package manager | `apt-get` | `apk` | None |
+| User | `node` | `node` (UID 100) | `root` (or `nonroot` with `:nonroot`) |
+
+- **Distroless is bigger than Alpine** (145 MB against 80.7 MB), mostly because its Node.js layer (99 MB) is the full official build, which is bigger than Alpine's `nodejs` package. But it has far fewer **programs**: only Node.js, with nothing an attacker can use to explore or change the container.
+- **No native-module problem.** Stage 1 (`node:20`) and stage 2 are both Debian 12 with glibc, and both run Node.js v20.20.2. Packages with native code built in stage 1 work in stage 2, unlike in [App 4](#watch-out-native-modules).
+- **Up-to-date Node.js.** The image comes with Node.js already built in, and Google keeps it updated. You do not depend on the version an Alpine release ships.
+
+### When to use distroless
+
+**Benefits:**
+
+- **Very small attack surface.** No shell, no package manager and no basic commands, so an attacker who gets in has almost nothing to work with.
+- **Fewer security warnings.** Security scanners find far fewer packages to report on.
+- **glibc, like the build stage.** Native modules built on `node:20` work without changes.
+- **Current Node.js**, maintained by Google.
+
+**Drawbacks:**
+
+- **Hard to debug.** No shell, no `ls`, no `ps`. You need `docker logs`, `docker top` or a `:debug` image.
+- **Must be a multi-stage build.** You cannot run `npm ci` or any other command in the runtime image.
+- **No `node` user, and root by default.** Use the `:nonroot` image.
+- **Fewer choices.** Google publishes only some runtimes and versions. You cannot add a package if the app needs one.
+
+**Use distroless when** the app is going to production, you already use a multi-stage build, and security matters more than easy debugging. Use the `:nonroot` image.
+
+**Use Alpine or `node:20-slim` when** you need a shell to debug or run scripts in the container, or the app needs extra system packages at run time.
