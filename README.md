@@ -64,8 +64,20 @@
    - [Build and run the static site](#build-and-run-the-static-site)
    - [What is inside the final image](#what-is-inside-the-final-image)
    - [Your Dockerfile and solution.Dockerfile](#your-dockerfile-and-solutiondockerfile)
+   - [Serve the site with a bind mount](#serve-the-site-with-a-bind-mount)
+   - [Bind mounts](#bind-mounts)
    - [Improving the static site build](#improving-the-static-site-build)
    - [When to serve static files with nginx](#when-to-serve-static-files-with-nginx)
+9. [App 7: docker-volume](#app-7-docker-volume)
+   - [The app: a counter that saves to a file](#the-app-a-counter-that-saves-to-a-file)
+   - [The incrementor Dockerfile](#the-incrementor-dockerfile)
+   - [Run the incrementor with a volume](#run-the-incrementor-with-a-volume)
+   - [Environment variables: --env](#environment-variables---env)
+   - [Volumes](#volumes)
+   - [Managing volumes](#managing-volumes)
+   - [Listing volumes: docker volume ls](#listing-volumes-docker-volume-ls)
+   - [Volumes and non-root users](#volumes-and-non-root-users)
+   - [Volumes, bind mounts and the container's own files](#volumes-bind-mounts-and-the-containers-own-files)
 
 ---
 
@@ -103,14 +115,17 @@ my_project/
 │   ├── index.js
 │   ├── package.json
 │   └── package-lock.json
-└── static-asset-project/                # App 6: build a website with Node.js, serve it with nginx
+├── static-asset-project/                # App 6: build a website with Node.js, serve it with nginx
+│   ├── Dockerfile
+│   ├── solution.Dockerfile
+│   ├── astro.config.mjs, tailwind.config.mjs, tsconfig.json
+│   ├── package.json
+│   ├── package-lock.json
+│   ├── public/                          # files copied as they are (favicon.svg)
+│   └── src/                             # pages, layouts and components
+└── docker-volume/                       # App 7: a counter that keeps its data in a volume
     ├── Dockerfile
-    ├── solution.Dockerfile
-    ├── astro.config.mjs, tailwind.config.mjs, tsconfig.json
-    ├── package.json
-    ├── package-lock.json
-    ├── public/                          # files copied as they are (favicon.svg)
-    └── src/                             # pages, layouts and components
+    └── index.js
 ```
 
 `node_modules/` is not committed (see `.gitignore`). In App 2 to App 5, the image installs its own copy during the build.
@@ -156,8 +171,10 @@ This runs the image's default command and the container stops when that command 
 | `--rm` | | Deletes the container automatically when it stops. Good for one-off runs. |
 | `--init` | | Runs a small init process as PID 1 so `Ctrl+C` and `docker stop` work properly. See [Run the web server](#run-the-web-server). |
 | `--publish 8080:3000` | `-p` | Maps port `8080` on your machine to port `3000` in the container. |
-| `--env KEY=value` | `-e` | Sets an environment variable inside the container. |
-| `--volume ./data:/app/data` | `-v` | Mounts a folder from your machine into the container, so files survive after it is deleted. |
+| `--env KEY=value` | `-e` | Sets an environment variable inside the container. See [Environment variables](#environment-variables---env). |
+| `--volume ./data:/app/data` | `-v` | Mounts a folder from your machine into the container, so files survive after it is deleted. See [Bind mounts](#bind-mounts). |
+| `--mount type=bind,source=...,target=...` | | The longer, clearer way to mount a folder. See [Bind mounts](#bind-mounts). |
+| `--mount type=volume,src=...,target=...` | | Attaches a Docker-managed volume, for data that must outlive the container. See [Volumes](#volumes). |
 
 Short flags can be combined, so `-it` is `-i -t` and `-dit` is `-d -i -t`.
 
@@ -1558,6 +1575,121 @@ To build the other file, give its name with `-f`:
 docker build . -f solution.Dockerfile -t my-static-site:debian
 ```
 
+### Serve the site with a bind mount
+
+You do not have to build an image to try the website. If you have built the site on your machine (`npm run build`, which creates `dist/`), you can **lend** that folder to a plain nginx container:
+
+```sh
+cd static-asset-project
+npm run build
+docker run --mount type=bind,source="$(pwd)"/dist,target=/usr/share/nginx/html -p 8080:80 nginx:latest
+```
+
+Open <http://localhost:8080> and you see the same "Welcome to Astro." page. No Dockerfile and no `docker build` are needed: the container uses the official `nginx:latest` image unchanged, and reads the files straight from your `dist/` folder.
+
+| Part | What it does |
+| --- | --- |
+| `docker run ... nginx:latest` | Starts a container from the official nginx image (Debian). |
+| `--mount` | Attaches storage to the container. |
+| `type=bind` | The storage is a **bind mount**: a folder from your machine. See [Bind mounts](#bind-mounts). |
+| `source="$(pwd)"/dist` | The folder on **your machine**. `$(pwd)` is replaced by the current folder, so this becomes `/Users/.../static-asset-project/dist`. The quotes keep it working if the path has spaces. |
+| `target=/usr/share/nginx/html` | Where the folder appears **inside the container**: the folder nginx serves files from. |
+| `-p 8080:80` | Maps port `8080` on your machine to nginx's port `80`. |
+
+The command runs in the foreground. Press `Ctrl+C` to stop it. It has no `--rm`, so the stopped container stays in `docker ps --all` until you remove it. Add `--rm` (and `--name site`) to clean up automatically.
+
+#### Why use a bind mount here?
+
+- **Changes show up at once.** Run `npm run build` again, and refresh the browser: nginx serves the new files right away. You do not rebuild the image or restart the container.
+- **Quick testing.** You can check how the built site looks in real nginx in a few seconds.
+
+#### What happens to the files in the image?
+
+The bind mount **hides** whatever the image had in `/usr/share/nginx/html`. The image's own `index.html` and `50x.html` are still there underneath, but the container only sees your `dist/` folder. Here `/50x.html` returns `404`, because `dist/` does not have it.
+
+Inside the container:
+
+```sh
+docker exec <container> ls -la /usr/share/nginx/html
+# _astro  favicon.svg  index.html   (your dist/ folder, no 50x.html)
+```
+
+`docker inspect` shows the mount:
+
+```json
+[{"Type":"bind","Source":"/Users/<you>/.../static-asset-project/dist","Destination":"/usr/share/nginx/html","Mode":"","RW":true,"Propagation":"rprivate"}]
+```
+
+`"RW":true` means the container can **write** to your folder. See [Read-only bind mounts](#read-only-bind-mounts).
+
+#### Bind mount or COPY?
+
+| | Bind mount (this command) | `COPY` in a Dockerfile (App 6) |
+| --- | --- | --- |
+| Where the files are | On your machine, lent to the container | Inside the image |
+| Needs `docker build` | No | Yes |
+| After you change a file | Visible at once | Rebuild the image |
+| Works on another computer | No, the folder must exist on that machine | Yes, the image has everything |
+| Good for | Development and quick testing | Production and sharing |
+
+Use a bind mount while you work on the site, and the Dockerfile from App 6 when you ship it.
+
+### Bind mounts
+
+A **bind mount** connects a folder (or a single file) on your machine to a path inside a container. It is not a copy: both sides see **the same files**.
+
+- When you change a file on your machine, the container sees the change at once.
+- When the container writes a file, it appears on your machine.
+- When the container is deleted, the files stay on your machine.
+
+Tested on this project: after a bind mount, editing `index.html` on the Mac changed the page in the browser without a restart, and a file written by `docker exec` inside the container appeared in the Mac folder and was still there after the container stopped.
+
+#### Two ways to write it: --mount and -v
+
+```sh
+# --mount: longer, every part is named
+docker run --mount type=bind,source="$(pwd)"/dist,target=/usr/share/nginx/html -p 8080:80 nginx:latest
+
+# -v (--volume): shorter, SOURCE:TARGET
+docker run -v "$(pwd)"/dist:/usr/share/nginx/html -p 8080:80 nginx:latest
+```
+
+Both do the same thing, with one important difference, tested here:
+
+| If the source folder does not exist | |
+| --- | --- |
+| `--mount` | Fails with `bind source path does not exist`. |
+| `-v` | Creates an **empty** folder and mounts it. nginx then serves an empty folder, so you get `403 Forbidden` instead of your site, with no warning about the path. |
+
+`--mount` is the clearer and safer choice, because a typo in the path gives an error instead of a silent empty folder.
+
+#### The source must be an absolute path
+
+```sh
+docker run --mount type=bind,source=dist,target=/usr/share/nginx/html nginx:latest
+# invalid mount path: 'dist' mount path must be absolute
+```
+
+That is why the command uses `"$(pwd)"/dist`: it turns the relative `dist` into a full path.
+
+#### Read-only bind mounts
+
+By default, the container can change and delete your files. nginx only needs to read them, so add `readonly` (or `ro`):
+
+```sh
+docker run --mount type=bind,source="$(pwd)"/dist,target=/usr/share/nginx/html,readonly -p 8080:80 nginx:latest
+```
+
+Tested here: the site still works, and writing from inside the container fails with `Read-only file system`. With `-v`, add `:ro` at the end: `-v "$(pwd)"/dist:/usr/share/nginx/html:ro`.
+
+#### Things to know about bind mounts
+
+- **The container can damage your files.** It runs as `root` here, so without `readonly` it can change or delete anything in the folder. Mount only the folder you need, never your home folder.
+- **They depend on the machine.** The path must exist on the computer that runs the container, so a bind mount is not part of the image and does not work on a server unless the folder is there too.
+- **File owners can look different.** On Docker Desktop for Mac, files from the Mac can appear inside the container with owners like `root`, and files the container writes appear on the Mac as owned by you.
+- **On Mac and Windows they are slower.** Docker runs Linux in a small virtual machine, and every file access is passed between your system and that machine. For folders with many small files, like `node_modules`, this can be noticeably slow.
+- **They are not volumes.** A **volume** (`--mount type=volume,source=mydata,target=...`) is storage that Docker creates and manages itself, not a folder you choose. Volumes are better for data that only the container needs, like a database's files. Bind mounts are better when **you** need to see or edit the files, like source code or a built website. See [Volumes](#volumes).
+
 ### Improving the static site build
 
 The Dockerfile works, but it has the same two problems that [App 2](#app-2-build-a-more-complicated-nodejs-app) solved:
@@ -1604,3 +1736,341 @@ With these two changes, Docker no longer sends `node_modules` to the build, and 
 **It does not work when** the site needs code on the server for each request, for example a login, a database, an API, or pages rendered on the server (Astro's server mode, Next.js server features). Then you need a Node.js server, as in Apps 1 to 5. nginx is often still used **in front of** it.
 
 To change how nginx behaves (for example, single-page apps that need every path to return `index.html`, caching headers, or redirects), copy your own configuration file into `/etc/nginx/conf.d/default.conf`.
+
+---
+
+## App 7: docker-volume
+
+All the apps so far kept nothing: when a container was deleted, everything it had written was gone. This app, in the `docker-volume/` folder, shows how to keep data **between containers** with a **volume**.
+
+### The app: a counter that saves to a file
+
+```js
+const fs = require("fs").promises;
+const path = require("path");
+
+const dataPath = path.join(process.env.DATA_PATH || "./data.txt");
+
+fs.readFile(dataPath)
+  .then((buffer) => {
+    const data = buffer.toString();
+    const dataToWrite = +data + 1;
+    console.log(`${dataPath} found, incrementing by 1:`, dataToWrite);
+    writeTo(dataToWrite);
+  })
+  .catch((e) => {
+    console.log(`file not found, writing "0" to ${dataPath}`);
+    writeTo(0);
+  });
+
+const writeTo = (data) => {
+  fs.writeFile(dataPath, data.toString()).catch(console.error);
+};
+```
+
+- It reads the path of its data file from the environment variable `DATA_PATH`. If it is not set, it uses `./data.txt`.
+- If the file exists, it reads the number in it, adds 1 and writes it back (`+data` turns the text into a number).
+- If the file does not exist, it writes `0`.
+- Then it exits. It is not a server, so the container stops after each run.
+
+Each run adds 1, **if** the file survives from one run to the next. That is what the volume is for.
+
+### The incrementor Dockerfile
+
+```dockerfile
+FROM node:20-alpine
+COPY --chown=node:node . /src
+WORKDIR /src
+CMD ["node", "index.js"]
+```
+
+- `FROM node:20-alpine`: the small Alpine Node.js image. See [App 3](#app-3-alpine-linux).
+- `COPY --chown=node:node . /src`: copies the folder (here only `Dockerfile` and `index.js`) to `/src`, owned by `node`.
+- `WORKDIR /src`: makes `/src` the current directory, so `node index.js` finds the file.
+- `CMD ["node", "index.js"]`: runs the script.
+
+There is **no `USER`**, so the script runs as `root` (`whoami` prints `root`). This matters for volumes: see [Volumes and non-root users](#volumes-and-non-root-users).
+
+There is also no `/data` folder in the image. The volume creates it.
+
+Build it:
+
+```sh
+cd docker-volume
+docker build . -t incrementor
+```
+
+### Run the incrementor with a volume
+
+```sh
+docker run --rm --env DATA_PATH=/data/num.txt --mount type=volume,src=incrementor-data,target=/data incrementor
+```
+
+| Part | What it does |
+| --- | --- |
+| `docker run --rm` | Starts a new container and deletes it when it stops. The **volume is not deleted**: `--rm` only removes the container. |
+| `--env DATA_PATH=/data/num.txt` | Sets the environment variable `DATA_PATH`, so the script saves to `/data/num.txt`. See [Environment variables](#environment-variables---env). |
+| `--mount` | Attaches storage to the container. |
+| `type=volume` | The storage is a **volume**, managed by Docker. See [Volumes](#volumes). |
+| `src=incrementor-data` | The **name** of the volume. If no volume with this name exists, Docker creates it. `src` is short for `source`. |
+| `target=/data` | Where the volume appears inside the container. Files written to `/data` go into the volume. |
+| `incrementor` | The image to run. |
+
+Run it a few times. Measured on this project:
+
+```
+$ docker run --rm --env DATA_PATH=/data/num.txt --mount type=volume,src=incrementor-data,target=/data incrementor
+file not found, writing "0" to /data/num.txt
+$ docker run --rm --env DATA_PATH=/data/num.txt --mount type=volume,src=incrementor-data,target=/data incrementor
+/data/num.txt found, incrementing by 1: 1
+$ docker run --rm --env DATA_PATH=/data/num.txt --mount type=volume,src=incrementor-data,target=/data incrementor
+/data/num.txt found, incrementing by 1: 2
+```
+
+Every run is a **new** container, and each one is deleted at the end. But the number keeps growing, because `/data/num.txt` lives in the volume, not in the container.
+
+#### Without the volume
+
+Leave out `--mount`, and every run starts from nothing. Here it is even worse: `/data` does not exist in the image, so the script cannot save at all:
+
+```
+file not found, writing "0" to /data/num.txt
+Error: ENOENT: no such file or directory, open '/data/num.txt'
+```
+
+#### Without DATA_PATH
+
+Leave out `--env`, and the script writes `./data.txt`, which is `/src/data.txt` in the container. That is **outside** the volume, so it is lost when the container is deleted. Every run prints `file not found, writing "0" to data.txt`, even though the volume is attached.
+
+The volume only keeps what is written **inside** its `target` folder.
+
+#### The short form: -v
+
+```sh
+docker run --rm -e DATA_PATH=/data/num.txt -v incrementor-data:/data incrementor
+```
+
+`-e` is `--env`, and `-v NAME:PATH` mounts a volume. When the part before `:` is a **name** (not a path starting with `/`), `-v` creates a volume. When it is a path, `-v` makes a [bind mount](#bind-mounts).
+
+### Environment variables: --env
+
+An **environment variable** is a named setting that a program reads when it starts. In Node.js, they are in `process.env`, so `--env DATA_PATH=/data/num.txt` makes `process.env.DATA_PATH` equal `"/data/num.txt"`.
+
+They let you change how a container behaves **without rebuilding the image**: the same `incrementor` image can save anywhere you choose.
+
+```sh
+docker run --env KEY=value ...          # one variable
+docker run -e KEY1=a -e KEY2=b ...      # several
+docker run --env-file .env ...          # read KEY=value lines from a file
+```
+
+A Dockerfile can also set a default with `ENV DATA_PATH=/data/num.txt`, and `--env` overrides it.
+
+Do not put passwords in a Dockerfile `ENV`: they become part of the image, and anyone with the image can read them with `docker inspect`.
+
+### Volumes
+
+A **volume** is storage that Docker creates and manages. It lives **outside** any container, so it survives when containers are stopped, deleted or replaced with a newer image.
+
+- **Docker chooses where it is stored.** `docker volume inspect` shows a `Mountpoint` like `/var/lib/docker/volumes/incrementor-data/_data`. On Docker Desktop for Mac, that path is inside Docker's Linux virtual machine, **not** on your Mac, so you cannot open it in Finder.
+- **You refer to it by name**, like `incrementor-data`. Any container can use it with `--mount type=volume,src=incrementor-data,...`.
+- **It starts empty**, unless the image already has files in the `target` folder (see [Volumes and non-root users](#volumes-and-non-root-users)).
+- **Several containers can use it**, at the same time or one after another.
+
+Volumes are the standard way to keep data such as:
+
+- database files (PostgreSQL, MySQL, MongoDB)
+- files that users upload
+- caches you want to keep between runs
+
+#### Look inside a volume
+
+You cannot open a volume from your Mac, but any container can mount it. A tiny Alpine container is enough:
+
+```sh
+docker run --rm --mount type=volume,src=incrementor-data,target=/data alpine sh -c 'ls -la /data; cat /data/num.txt'
+```
+
+Measured here, after three runs: it lists `num.txt` (owned by `root`) and prints `2`.
+
+### Managing volumes
+
+| Command | What it does |
+| --- | --- |
+| `docker volume create incrementor-data` | Creates an empty volume. Not needed here: `docker run --mount` creates it if it is missing. |
+| `docker volume ls` | Lists all volumes. See [Listing volumes](#listing-volumes-docker-volume-ls). |
+| `docker volume inspect incrementor-data` | Shows details: driver, `Mountpoint`, creation date. |
+| `docker volume rm incrementor-data` | Deletes the volume **and all its data**. The next run starts again from `0`. |
+| `docker volume prune` | Deletes unused volumes. See the warning below. |
+
+#### Listing volumes: docker volume ls
+
+```sh
+docker volume ls
+```
+
+Lists every volume on this machine. `docker volume list` does the same thing. Output on this machine (shortened):
+
+```
+DRIVER    VOLUME NAME
+local     0a35fab2738ec3edc9ebda1fd80193ecb35a2beb8127ab9b5077eca8b3566ed5
+local     2bc7811367bc8d134006f443a709e90e84506780821fd8087f87abb6d1f38ff6
+...
+local     incrementor-data
+local     transcendence_avatar-data
+local     transcendence_db-data
+```
+
+| Column | Meaning |
+| --- | --- |
+| `DRIVER` | Where the data is stored. `local` means on this machine, in Docker's storage area. |
+| `VOLUME NAME` | The volume's name. A long random name (64 hexadecimal characters) means an **anonymous** volume. A readable name means a **named** volume. |
+
+What the names tell you:
+
+- **`incrementor-data`** was created by `--mount type=volume,src=incrementor-data` in [App 7](#run-the-incrementor-with-a-volume).
+- **`transcendence_avatar-data`** and **`transcendence_db-data`** were created by Docker Compose. Compose names volumes `<project>_<volume>`, so these are the `avatar-data` and `db-data` volumes of a project called `transcendence`.
+- **The random names** are anonymous volumes. Nothing in the list says which container or image made them.
+
+On this machine, `docker volume ls` lists **87** volumes, and 80 of them are not used by any container. `docker system df` shows that volumes take **35.11 GB**, of which 33.85 GB (96%) is "reclaimable", meaning no container uses it. That does **not** mean the data is useless. It only means no container is attached to it right now.
+
+`docker volume ls` does not show sizes. To see how big each volume is, and how many containers use it (`LINKS`), use:
+
+```sh
+docker system df -v
+```
+
+```
+VOLUME NAME                 LINKS     SIZE
+transcendence_db-data       1         66MB
+transcendence_avatar-data   2         138.7kB
+```
+
+##### Options
+
+| Option | What it does |
+| --- | --- |
+| `--quiet` (`-q`) | Prints only the names, one per line. Useful in scripts. |
+| `--filter` (`-f`) | Shows only the volumes that match. You can use it several times; a volume must match all of them. |
+| `--format` | Chooses which fields to print, with a Go template. |
+
+##### Filters
+
+| Filter | Shows | Example |
+| --- | --- | --- |
+| `name=<text>` | Volumes whose name **contains** the text. | `docker volume ls -f name=transcendence` |
+| `dangling=true` | Volumes that **no container** uses, running or stopped. | `docker volume ls -f dangling=true` |
+| `dangling=false` | Volumes that at least one container uses. | `docker volume ls -f dangling=false` |
+| `label=<key>` or `label=<key>=<value>` | Volumes with that label. | `docker volume ls -f label=com.docker.compose.project=transcendence` |
+| `driver=<name>` | Volumes that use that driver. | `docker volume ls -f driver=local` |
+
+Tested on this machine:
+
+```sh
+docker volume ls --filter name=transcendence
+```
+
+```
+DRIVER    VOLUME NAME
+local     transcendence_avatar-data
+local     transcendence_db-data
+```
+
+**"Dangling" does not mean "safe to delete".** A volume is dangling when no container is attached to it. `incrementor-data` is dangling after every run, because `--rm` deletes the container, but the volume still holds the counter you want to keep. `docker volume ls -f dangling=true` shows exactly what [`docker volume prune`](#managing-volumes) would delete, so check that list before pruning.
+
+`transcendence_db-data` is **not** dangling, even though its container has stopped (`transcendence-db-1`, `Exited`). A stopped container still counts as using its volumes, until the container is removed.
+
+##### Custom output: --format
+
+`--format` takes a template with these fields: `{{.Name}}`, `{{.Driver}}`, `{{.Scope}}`, `{{.Mountpoint}}`, `{{.Labels}}`, and `{{.Label "key"}}` for one label. Start the template with `table` to get column headings:
+
+```sh
+docker volume ls --filter name=transcendence --format 'table {{.Name}}\t{{.Driver}}\t{{.Labels}}'
+```
+
+```
+VOLUME NAME                 DRIVER    LABELS
+transcendence_avatar-data   local     com.docker.compose.volume=avatar-data,com.docker.compose.project=transcendence,com.docker.compose.version=2.15.1
+transcendence_db-data       local     com.docker.compose.volume=db-data,com.docker.compose.project=transcendence,com.docker.compose.version=2.15.1
+```
+
+The labels show that Docker Compose 2.15.1 created these volumes, for the `transcendence` project. Anonymous volumes have no labels (`null`).
+
+##### Useful combinations
+
+```sh
+# Count all volumes
+docker volume ls -q | wc -l
+
+# Show only volumes that no container uses (what prune would delete)
+docker volume ls -f dangling=true
+
+# Show the containers, running or stopped, that use a volume
+docker ps -a --filter volume=transcendence_db-data
+```
+
+Example output of `docker volume inspect`:
+
+```json
+[
+    {
+        "CreatedAt": "2026-11-03T17:54:18Z",
+        "Driver": "local",
+        "Labels": null,
+        "Mountpoint": "/var/lib/docker/volumes/incrementor-data/_data",
+        "Name": "incrementor-data",
+        "Options": null,
+        "Scope": "local"
+    }
+]
+```
+
+- `Driver: local` means the data is stored on this machine. Other drivers can store volumes on network storage or in the cloud.
+- `Scope: local` means only containers on this machine can use it.
+
+**A volume in use cannot be deleted.** While a container uses it, `docker volume rm` fails with `volume is in use`. Stop and remove the container first.
+
+**Anonymous volumes.** `docker volume ls` may show many volumes with long random names, like `0a35fab2738e...`. Those are **anonymous** volumes: volumes without a name, created by images that declare a `VOLUME` (for example database images) or by `-v /path` with no name. Named volumes like `incrementor-data` are easier to find and reuse. With `--rm`, Docker deletes a container's anonymous volumes, but never its named ones.
+
+**Be careful with `docker volume prune`.** It deletes every volume that no container is using **right now**. On older Docker versions (Docker Engine 20.10, like on this machine), that includes **named** volumes, for example a project's database volume, even if you still need it. Newer versions (Docker 23 and later) remove only anonymous volumes unless you add `--all`. Check `docker volume ls` first, and delete volumes one by one with `docker volume rm` when in doubt.
+
+### Volumes and non-root users
+
+This image runs as `root`, so it can write to the new volume. Earlier sections recommend a non-root user, but that causes a problem here. Tested with `USER node` added to the Dockerfile:
+
+```
+file not found, writing "0" to /data/num.txt
+Error: EACCES: permission denied, open '/data/num.txt'
+```
+
+The image has no `/data` folder, so Docker creates the volume's folder owned by `root`, and `node` cannot write to it.
+
+**The fix:** create the folder in the image, owned by `node`, **before** `USER`:
+
+```dockerfile
+FROM node:20-alpine
+RUN mkdir /data && chown node:node /data
+COPY --chown=node:node . /src
+WORKDIR /src
+USER node
+CMD ["node", "index.js"]
+```
+
+When a **new, empty** volume is mounted on a folder that exists in the image, Docker copies that folder's contents **and owner** into the volume. Tested here: the volume's `/data` is owned by UID `1000` (`node`), and the counter works again as `node`.
+
+This copy happens only once, when the volume is empty. A volume that already has data keeps its own files and owners.
+
+### Volumes, bind mounts and the container's own files
+
+| | Container's own files | Volume | Bind mount |
+| --- | --- | --- | --- |
+| Example | `/src/data.txt` (no mount) | `--mount type=volume,src=incrementor-data,target=/data` | `--mount type=bind,source="$(pwd)"/dist,target=...` |
+| Who manages it | The container | Docker | You (it is a folder on your machine) |
+| Survives `docker rm` / `--rm` | No | **Yes** | Yes |
+| Where it is stored | In the container's writable layer | Docker's storage area (`/var/lib/docker/volumes/`) | Any folder you choose |
+| Easy to see and edit from your Mac | No | No (use a container to look inside) | **Yes** |
+| Speed on Docker Desktop for Mac | Fast | Fast | Slower |
+| Needs a path that exists on the machine | No | No | Yes |
+| Good for | Temporary files | Data the app needs to keep: databases, uploads | Source code, built websites, config you edit |
+
+**Rule of thumb:** if **you** need to work with the files, use a bind mount. If only the **app** needs them, and they must survive, use a volume.
