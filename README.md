@@ -10,6 +10,7 @@
    - [Processes inside a container: ps aux](#processes-inside-a-container-ps-aux)
    - [Cleaning up](#cleaning-up)
    - [System information](#system-information)
+   - [Security scanning: docker scout](#security-scanning-docker-scout)
 3. [App 1: build-a-nodejs-app](#app-1-build-a-nodejs-app)
    - [The app: index.js](#the-app-indexjs)
    - [How the Dockerfile works](#how-the-dockerfile-works)
@@ -271,6 +272,102 @@ See [App 3: alpine-linux](#app-3-alpine-linux).
 | `docker version` | Shows the version of the Docker client and the Docker engine. |
 | `docker info` | Shows system-wide details: number of containers and images, storage driver, CPUs, memory and more. |
 | `docker --help` | Lists all commands. Use `docker <command> --help` for help with one command, for example `docker run --help`. |
+
+### Security scanning: docker scout
+
+[Docker Scout](https://docs.docker.com/scout/) checks an image for **known security holes**. It makes a list of every package in the image (an SBOM, "software bill of materials"), then compares that list with public vulnerability databases.
+
+Each known security hole has an ID called a **CVE** ("Common Vulnerabilities and Exposures"), for example `CVE-2024-5535`. Each CVE gets a **severity**:
+
+| Letter | Severity | Meaning |
+| --- | --- | --- |
+| `C` | Critical | Fix now. Often easy to attack, with serious damage. |
+| `H` | High | Fix soon. |
+| `M` | Medium | Fix when you can. |
+| `L` | Low | Small risk. |
+
+The package list is sent to Docker's service to be checked, so you need an internet connection. Newer versions of Docker Scout ask you to sign in first with `docker login`.
+
+#### docker scout quickview
+
+```sh
+docker scout quickview alpine:3.19.1
+```
+
+Shows a **short summary** of an image: how many vulnerabilities it has at each severity (for example `1C 5H 10M 2L`). It shows the same counts for the image's **base image**, and, if there is one, suggests a newer base image with fewer vulnerabilities. Use it first, to see whether an image has a problem at all.
+
+`quickview` needs a recent Docker Scout. On this machine, Docker Scout is v0.6.0, which only has `cves` and fails with `unknown command: "quickview"`. Update Docker Desktop to get it, and check your version with `docker scout version`.
+
+#### docker scout cves
+
+```sh
+docker scout cves alpine:3.19.1
+```
+
+Shows the **full list**: every vulnerable package, every CVE in it, and the version that fixes it. Use it after `quickview`, to see what to fix.
+
+Result for `alpine:3.19.1`, measured on this project (shortened):
+
+```
+    ✓ Indexed 19 packages
+    ✗ Detected 3 vulnerable packages with a total of 18 vulnerabilities
+
+  1C    3H    5M    0L  openssl 3.1.4-r5
+    ✗ CRITICAL CVE-2024-5535
+      https://scout.docker.com/v/CVE-2024-5535?...
+      Affected range : <3.1.6-r0
+      Fixed version  : 3.1.6-r0
+    ...
+
+  0C    2H    1M    0L  musl 1.2.4_git20230717-r4
+    ...
+
+  0C    0H    4M    2L  busybox 1.36.1-r15
+    ...
+
+  LOW      | 2
+  MEDIUM   | 10
+  HIGH     | 5
+  CRITICAL | 1
+```
+
+How to read it:
+
+- `Indexed 19 packages`: Scout found 19 packages in the image.
+- Each block starts with **one package** and its version, for example `openssl 3.1.4-r5`, and the number of CVEs in it by severity.
+- `Affected range : <3.1.6-r0` means every version **before** `3.1.6-r0` has this hole.
+- `Fixed version : 3.1.6-r0` is the first version without it. Every CVE here has a fixed version, so all 18 can be fixed by updating.
+- The link opens a page about the CVE on Docker's website.
+- The table at the end counts all CVEs by severity.
+
+Useful options:
+
+| Option | What it does |
+| --- | --- |
+| `--exit-code` (`-e`) | Exits with code `2` if vulnerabilities are found. In CI, this makes the job fail. |
+| `--format sarif --output report.json` | Saves the report as a SARIF file, a format that GitHub and other tools can read. |
+| `--details` | Prints more details for each CVE. |
+
+You can also scan your own images, for example `docker scout cves my-fastify-app:alpine`.
+
+#### Why does alpine:3.19.1 have 18 vulnerabilities?
+
+An image is **frozen** when it is built. `alpine:3.19.1` was released in January 2024, so it contains the package versions from that time. Security fixes released later are in Alpine's package repository, but **not** in that image.
+
+Measured on this project:
+
+| Image | Vulnerabilities |
+| --- | --- |
+| `alpine:3.19.1` (an old patch release) | 18 (1 critical, 5 high, 10 medium, 2 low) |
+| `alpine:3.19` (the newest 3.19 patch release, 3.19.9) | 4 (1 high, 1 medium, 2 low) |
+| `alpine:3.19.1` + `RUN apk upgrade --no-cache` | **0** ("No vulnerable package detected") |
+
+So, to get rid of known vulnerabilities:
+
+- **Use the newest patch release.** Use the tag `alpine:3.19` (always the newest `3.19.x`) instead of an exact one like `3.19.1`. Even better, use a newer Alpine version that is still supported.
+- **Update the packages during the build.** `RUN apk upgrade --no-cache` installs the fixed versions. Here it made the image bigger (15.2 MB instead of 7.7 MB), because the updated files are stored in a new layer on top of the old ones.
+- **Rebuild your images regularly**, so they pick up new fixes from the base image.
+- **Scan again after every change.** New CVEs are found all the time, so an image with 0 today can have some next month.
 
 ---
 
@@ -796,7 +893,7 @@ The app itself, its dependencies and Fastify add only about 10 MB in both cases.
 
 - **Much smaller images.** 146 MB instead of 1.11 GB, about 8 times smaller. They use less disk space on your machine and on servers.
 - **Faster pulls and pushes.** Uploading to a registry and downloading on a server or in CI takes much less time. This matters when you deploy often or start containers on many machines.
-- **Smaller attack surface.** 18 packages instead of 413. Fewer programs mean fewer possible security holes, and fewer warnings when you scan the image with a security scanner (for example `docker scout cves`).
+- **Smaller attack surface.** 18 packages instead of 413. Fewer programs mean fewer possible security holes, and fewer warnings when you scan the image with a security scanner (for example `docker scout cves`, see [Security scanning: docker scout](#security-scanning-docker-scout)).
 - **Fewer tools for an attacker.** If someone breaks into the container, there is no `bash`, `git`, `curl` or compiler to help them.
 - **Nothing else changes for this app.** Fastify is plain JavaScript, so it runs on Alpine without changes.
 
@@ -942,7 +1039,7 @@ Both versions return `{"hello":"world"}` and log the same JSON lines.
 **Version 2 drawbacks:**
 
 - **Older Node.js, chosen by Alpine.** You get the version Alpine 3.19 ships (v20.15.1), not the newest v20 release (v20.20.2). The newer releases include security fixes, and you cannot upgrade without changing the Alpine version.
-- **Alpine 3.19 is out of support.** Its security updates ended in November 2025, so its packages, including Node.js, no longer get fixes. Use a supported Alpine release, and check which Node.js version its `nodejs` package has at [pkgs.alpinelinux.org](https://pkgs.alpinelinux.org/packages?name=nodejs).
+- **Alpine 3.19 is past its end of support.** Its official support ended in November 2025. Some fixes still reached the 3.19 package repository after that (for example a 2026 fix for musl), but they are no longer promised, and the newest 3.19 image (3.19.9) still has 4 known vulnerabilities. See [Security scanning: docker scout](#security-scanning-docker-scout). Use a supported Alpine release, and check which Node.js version its `nodejs` package has at [pkgs.alpinelinux.org](https://pkgs.alpinelinux.org/packages?name=nodejs).
 - **More to maintain.** You write and look after the install and user lines that the official image already does for you.
 - **Different from the official image.** The UID (`100`, not `1000`) and the missing `ENTRYPOINT` can surprise people who know the official `node` images.
 
@@ -1101,7 +1198,7 @@ These changes are optional. They are tested on this project:
   The image shrinks from **80.7 MB** to **71.1 MB**, and the app still runs. Without npm in the image, nobody can install packages into the running container.
 - **Remove the two `RUN mkdir` lines.** `WORKDIR` creates the folder anyway (owned by the current `USER`, see [More about WORKDIR](#more-about-workdir)), and each `RUN` adds a step to the build.
 - **Name the production stage**, for example `FROM alpine:3.19 AS production`. Then the build output says `production` instead of `stage-1`.
-- **Use a supported Alpine version.** Alpine 3.19 no longer gets security updates. See [Which version to use](#which-version-to-use).
+- **Use a supported Alpine version.** Alpine 3.19 is past its end of support, and its fixes are no longer promised. See [Which version to use](#which-version-to-use) and [docker scout](#security-scanning-docker-scout).
 
 ### When to use multi-stage builds
 
