@@ -78,6 +78,17 @@
    - [Listing volumes: docker volume ls](#listing-volumes-docker-volume-ls)
    - [Volumes and non-root users](#volumes-and-non-root-users)
    - [Volumes, bind mounts and the container's own files](#volumes-bind-mounts-and-the-containers-own-files)
+10. [Dev Containers: dev-containers](#dev-containers-dev-containers)
+    - [What is a dev container?](#what-is-a-dev-container)
+    - [Why a Rails app?](#why-a-rails-app)
+    - [Open the app in the dev container](#open-the-app-in-the-dev-container)
+    - [What this devcontainer.json sets up](#what-this-devcontainerjson-sets-up)
+    - [forwardPorts and --publish compared](#forwardports-and---publish-compared)
+    - [The Ruby version in the Gemfile](#the-ruby-version-in-the-gemfile)
+    - [The dev container and the Dockerfile compared](#the-dev-container-and-the-dockerfile-compared)
+    - [Dependabot: automatic updates](#dependabot-automatic-updates)
+    - [Why there is no dev container at the root](#why-there-is-no-dev-container-at-the-root)
+    - [When to use a dev container](#when-to-use-a-dev-container)
 
 ---
 
@@ -123,9 +134,18 @@ my_project/
 │   ├── package-lock.json
 │   ├── public/                          # files copied as they are (favicon.svg)
 │   └── src/                             # pages, layouts and components
-└── docker-volume/                       # App 7: a counter that keeps its data in a volume
-    ├── Dockerfile
-    └── index.js
+├── docker-volume/                       # App 7: a counter that keeps its data in a volume
+│   ├── Dockerfile
+│   └── index.js
+└── dev-containers/                      # Section 10: a Rails app you work on in a dev container
+    ├── .devcontainer/
+    │   └── devcontainer.json            # how VS Code builds the dev container
+    ├── .github/
+    │   └── dependabot.yml               # Dependabot settings (no effect in this repository, see section 10)
+    ├── Dockerfile                       # production image, not used by the dev container
+    ├── Gemfile, Gemfile.lock            # Ruby version and gems
+    ├── bin/setup                        # runs once, after the dev container is created
+    └── app/, config/, db/, ...          # the Rails app
 ```
 
 `node_modules/` is not committed (see `.gitignore`). In App 2 to App 5, the image installs its own copy during the build.
@@ -2074,3 +2094,237 @@ This copy happens only once, when the volume is empty. A volume that already has
 | Good for | Temporary files | Data the app needs to keep: databases, uploads | Source code, built websites, config you edit |
 
 **Rule of thumb:** if **you** need to work with the files, use a bind mount. If only the **app** needs them, and they must survive, use a volume.
+
+---
+
+## Dev Containers: dev-containers
+
+`dev-containers/` is a small Ruby on Rails app (Rails 7.1, Ruby 3.3, SQLite) with a **dev container** setup in `dev-containers/.devcontainer/devcontainer.json`. The app itself is only an example. This section is about the dev container. The `devcontainer.json` file has a comment on every setting.
+
+### What is a dev container?
+
+A **dev container** is a Docker container that your editor opens the project inside. Your files stay on your Mac, but the terminal and the tools (here: Ruby, Bundler and Rails) run in the container.
+
+| | Working on your Mac | Working in a dev container |
+| --- | --- | --- |
+| Where tools are installed | On your Mac | In the container |
+| Same tool versions for everyone | No, each person installs their own | **Yes**, `devcontainer.json` sets them |
+| Clean up | Uninstall each tool | Delete the container |
+| Where your files are | On your Mac | Still on your Mac, mounted into the container |
+
+The format is an open standard (<https://containers.dev>). VS Code, GitHub Codespaces and JetBrains IDEs can all read `devcontainer.json`.
+
+### Why a Rails app?
+
+A dev container is most useful when a project needs tools that you do not have on your Mac. To run this app on your Mac, you would need:
+
+- Ruby 3.3 (macOS does not have it)
+- Bundler, to install the gems
+- a C compiler and libraries, for gems with native code such as `sqlite3`
+
+The dev container image already has all of them. You install nothing on your Mac.
+
+Apps 1 to 7 are different: they only need Docker Desktop, because each app installs Node.js in its own image. That is why they do not have a dev container. See [Why there is no dev container at the root](#why-there-is-no-dev-container-at-the-root).
+
+### Open the app in the dev container
+
+1. Install the **Dev Containers** extension in VS Code (`ms-vscode-remote.remote-containers`).
+2. Make sure Docker Desktop is running.
+3. In VS Code, open the **`dev-containers`** folder itself (**File → Open Folder**), not `my_project`. VS Code looks for `.devcontainer/` only in the folder you open.
+4. Open the Command Palette (`Cmd+Shift+P`) and run **Dev Containers: Reopen in Container**.
+
+The first time, VS Code pulls the Ruby image and runs `./bin/setup`, so it takes a few minutes. After that, it reuses the container and starts fast. The bottom-left corner shows **Dev Container: Ruby** while you are inside.
+
+Then start the Rails server in the VS Code terminal:
+
+```sh
+bin/rails server
+```
+
+- <http://localhost:3000> shows the Rails welcome page. The app has no pages of its own yet (`root` is commented out in `config/routes.rb`).
+- <http://localhost:3000/up> is Rails' health check. It shows a green page when the app starts with no errors.
+
+Stop the server with `Ctrl+C`. To go back to your Mac, run **Dev Containers: Reopen Folder Locally**. If you change `devcontainer.json`, run **Dev Containers: Rebuild Container**.
+
+### What this devcontainer.json sets up
+
+| Setting | Value | What it does |
+| --- | --- | --- |
+| `name` | `Ruby` | The name VS Code shows. |
+| `image` | `mcr.microsoft.com/devcontainers/ruby:1-3.3-bullseye` | The image the container starts from. It has Ruby, Bundler, git, a C compiler and a non-root user called `vscode`. |
+| `forwardPorts` | `[3000]` | Makes port `3000` in the container available at <http://localhost:3000> on your Mac. |
+| `postCreateCommand` | `./bin/setup` | Runs once, after the container is created. |
+
+The image tag `1-3.3-bullseye` has three parts:
+
+| Part | Meaning |
+| --- | --- |
+| `1` | The version of Microsoft's dev container image, not of Ruby. |
+| `3.3` | The Ruby version. It is always the **newest** 3.3.x. |
+| `bullseye` | Debian 11, the Linux the image is built on. See [Alpine and Debian compared](#alpine-and-debian-compared). |
+
+`bin/setup` is a script that comes with every Rails app. Here it:
+
+1. installs the gems (`bundle install`)
+2. creates the SQLite database in `storage/development.sqlite3` (`bin/rails db:prepare`)
+3. deletes old logs and temporary files (`bin/rails log:clear tmp:clear`)
+
+The file also has settings that are commented out:
+
+- `features`: extra tools added on top of the image. This app needs none.
+- `customizations`: VS Code settings and extensions for the container.
+- `remoteUser`: the user to connect as. The default `vscode` user is not root, which is safer. See [Running as a non-root user](#running-as-a-non-root-user).
+
+### forwardPorts and --publish compared
+
+Apps 1 to 7 use `docker run --publish` to reach the server. The dev container uses `forwardPorts`. Both make a port in a container available on your Mac, but they work differently:
+
+| | `docker run --publish` (Apps 1 to 7) | `forwardPorts` (dev container) |
+| --- | --- | --- |
+| Where you set it | On every `docker run` | Once, in `devcontainer.json` |
+| How it works | Docker sends traffic from a port on your Mac to the container's network | VS Code connects to the port from **inside** the container and passes it to your Mac |
+| Server must listen on `0.0.0.0` | **Yes**. See [Why host 0.0.0.0?](#why-host-0000) | No, `localhost` works |
+| Add a port later | No, you need a new container | Yes, in VS Code's **Ports** tab |
+
+This is why `bin/rails server` works without `-b 0.0.0.0`, even though the Rails development server listens only on `localhost`.
+
+### The Ruby version in the Gemfile
+
+The Gemfile first said `ruby "3.3.0"`: **exactly** Ruby 3.3.0. But the image tag `3.3` always has the newest 3.3.x. Checked in the image's settings with `docker buildx imagetools inspect`, it has **Ruby 3.3.8**:
+
+```
+RUBY_VERSION=3.3.8
+```
+
+Bundler checks the Ruby version before it installs anything. If it does not match the Gemfile, `bundle install` stops with an error, so `./bin/setup` would fail the first time the container is created.
+
+**The fix:** the Gemfile now says:
+
+```ruby
+ruby "~> 3.3.0"
+```
+
+`~> 3.3.0` means "3.3.0 or newer, but less than 3.4". Any 3.3.x patch version is accepted, and those versions only fix bugs and security problems.
+
+This is the same lesson as image tags: a tag like `3.3` or `node:20` moves to new versions when they come out. Exact version pins elsewhere must allow for that.
+
+### The dev container and the Dockerfile compared
+
+The `dev-containers/` folder also has a `Dockerfile`. The dev container does **not** use it. They have different jobs:
+
+| | `.devcontainer/devcontainer.json` | `Dockerfile` |
+| --- | --- | --- |
+| What it is for | A place to **write and run** code | An image to **ship** the app in production |
+| Rails environment | `development` | `production` (`RAILS_ENV="production"`) |
+| Gems | All of them, including development and test gems | Only production gems (`BUNDLE_WITHOUT="development"`) |
+| Your code | Mounted from your Mac. Changes show right away. | Copied in when the image is built |
+| Build | One stage, from a ready-made image | [Multi-stage](#what-is-a-multi-stage-build): a build stage, then a smaller final stage |
+
+To use the Dockerfile for the dev container instead of the ready-made image, replace `image` with `"build": { "dockerfile": "../Dockerfile" }`. This is usually not what you want, because a production image has no development tools.
+
+### Dependabot: automatic updates
+
+#### What is Dependabot?
+
+**Dependabot** is a bot built into GitHub. It checks a project's dependencies for new versions and opens a **pull request** for each update. You read the pull request, and you merge it if the update is good. Nothing changes until you merge.
+
+It does two different jobs:
+
+| Job | What it does | How to turn it on |
+| --- | --- | --- |
+| **Version updates** | Opens pull requests when a newer version of a dependency comes out, on a schedule you choose | A `.github/dependabot.yml` file in the repository |
+| **Security updates** | Opens pull requests when a dependency you use has a known vulnerability | Repository **Settings → Code security** on GitHub. No file needed. |
+
+`dependabot.yml` controls **version updates**. Dependabot runs on GitHub's servers, not on your Mac, so it does nothing until the file is pushed to GitHub.
+
+Dependabot knows many **package ecosystems**. Some that match this repository:
+
+| `package-ecosystem` | What it updates | Example in this repository |
+| --- | --- | --- |
+| `npm` | Packages in `package.json` and `package-lock.json` | Fastify in Apps 2 to 5 |
+| `docker` | The image in each `FROM` line of a `Dockerfile` | `FROM node:20` |
+| `bundler` | Ruby gems in `Gemfile` and `Gemfile.lock` | Rails in `dev-containers/` |
+| `devcontainers` | Features in `devcontainer.json` | None yet |
+
+#### The dependabot.yml in dev-containers
+
+`dev-containers/.github/dependabot.yml` came with VS Code's Ruby dev container template:
+
+```yaml
+version: 2
+updates:
+ - package-ecosystem: "devcontainers"
+   directory: "/"
+   schedule:
+     interval: weekly
+```
+
+| Setting | What it means |
+| --- | --- |
+| `version: 2` | The version of the file format. It is always `2`. |
+| `updates` | A list. Each item is one ecosystem in one folder. |
+| `package-ecosystem: "devcontainers"` | Check the features in `devcontainer.json`. |
+| `directory: "/"` | Where to look, from the root of the repository. |
+| `schedule.interval: weekly` | How often to check: `daily`, `weekly` or `monthly`. |
+
+#### Why it does nothing in this repository
+
+**GitHub reads `dependabot.yml` only from the `.github/` folder at the root of the repository.** In this repository, the root is `my_project/`, so GitHub never reads `dev-containers/.github/dependabot.yml`. It is kept as an example.
+
+Even if GitHub read it, it would have nothing to update:
+
+- **`directory: "/"` is the wrong folder here.** It points to `my_project/`, but the dev container is in `my_project/dev-containers/`.
+- **The `devcontainers` ecosystem updates features only**, and this `devcontainer.json` has none. The image does not need it: the `3.3` tag already gets new 3.3.x versions when you rebuild.
+
+#### How to make it work
+
+There are two ways:
+
+1. **Make `dev-containers/` its own repository.** Then `dev-containers/` is the root, and the file works as it is. This is what the template expects.
+2. **Keep one repository and move the file.** Move it to `my_project/.github/dependabot.yml` and change the folder to `directory: "/dev-containers"`.
+
+To make it useful, add more ecosystems to `updates`. For example, this file checks the Rails gems and the `FROM` line of the Dockerfile every week:
+
+```yaml
+version: 2
+updates:
+ - package-ecosystem: "bundler"
+   directory: "/"
+   schedule:
+     interval: weekly
+ - package-ecosystem: "docker"
+   directory: "/"
+   schedule:
+     interval: weekly
+```
+
+The `directory` values are for way 1. For way 2, use `"/dev-containers"`.
+
+### Why there is no dev container at the root
+
+This repository had a dev container at the root (`my_project/.devcontainer/`) for a short time. It was removed because it did not help:
+
+- **Apps 1 to 7 only need Docker Desktop**, which is already on your Mac. Each app installs its own tools in its own image.
+- **It made some things harder.** The `docker` CLI in a dev container talks to Docker Desktop on your Mac. Docker Desktop reads bind mount paths on your Mac, not in the container. So `source="$(pwd)"/dist` from [App 6](#serve-the-site-with-a-bind-mount) pointed to a folder that does not exist on your Mac.
+
+The first version of that file also shows a common mistake. VS Code's **Dev Containers: Add Dev Container Configuration Files** command lets you pick features from a list, and all of them were selected: about **1,450 features** in 1,486 lines. That file was not usable:
+
+- **Some features conflict.** For example, `docker-in-docker` and `docker-outside-of-docker` both set up Docker, in different ways.
+- **Many features do not support Alpine**, the image it used. For example, `nvidia-cuda` and `anaconda` need Debian or Ubuntu.
+- **Each feature runs as root during the build.** Most came from third-party publishers. Every extra feature is more code you have to trust.
+- **Each feature makes the build slower** and the image bigger.
+
+Pick only the features you need. This is the same idea as the small images in [App 3](#app-3-alpine-linux) and [App 5](#app-5-distroless).
+
+### When to use a dev container
+
+Use a dev container when:
+
+- the project needs tools that you do not have on your Mac, like Ruby for this app
+- several people work on the project, and everyone must have the same tool versions
+- you want to use GitHub Codespaces, which uses the same `devcontainer.json`
+
+You do not need one when:
+
+- the project only needs tools you already have, like Docker Desktop for Apps 1 to 7
+- each app already runs in its own image
