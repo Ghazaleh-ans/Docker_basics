@@ -1,0 +1,61 @@
+// Dev container for the Rails app in this folder.
+//
+// A dev container is a Docker container that VS Code opens the project inside.
+// Your files stay on your Mac. VS Code mounts this folder into the container,
+// and the terminal, Ruby, Bundler and Rails all run inside the container.
+// You do not need to install Ruby on your Mac.
+//
+// To use it:
+//   1. Install the "Dev Containers" extension (ms-vscode-remote.remote-containers).
+//   2. In VS Code, open the dev-containers folder itself (File > Open Folder),
+//      not my_project. VS Code looks for .devcontainer/ only in the folder you open.
+//   3. Run "Dev Containers: Reopen in Container" from the Command Palette.
+//   4. In the VS Code terminal, run "bin/rails server" and open http://localhost:3000.
+// To go back: "Dev Containers: Reopen Folder Locally".
+// After you change this file: "Dev Containers: Rebuild Container".
+//
+// This file is JSONC (JSON with comments), so comments like these are allowed.
+// VS Code created it from the Ruby template:
+// https://github.com/devcontainers/templates/tree/main/src/ruby
+// Full reference: https://containers.dev/implementors/json_reference/
+{
+	// The name VS Code shows in the bottom-left corner while you are inside the container.
+	"name": "Ruby",
+
+	// The image the container starts from. The tag has three parts:
+	//   1        version of Microsoft's dev container image (not of Ruby)
+	//   3.3      Ruby version: always the newest 3.3.x (3.3.8 when this was written)
+	//   bullseye Debian 11, the Linux the image is built on
+	// The image already has Ruby, Bundler, git, a C compiler for gems,
+	// and a non-root user called "vscode".
+	// Because "3.3" moves to new patch versions, the Gemfile asks for "~> 3.3.0"
+	// (any 3.3.x), not exactly "3.3.0". Otherwise "bundle install" stops with an error.
+	// You could also build from your own Dockerfile here, with "build": { "dockerfile": "..." }.
+	// More info: https://containers.dev/guide/dockerfile
+	"image": "mcr.microsoft.com/devcontainers/ruby:1-3.3-bullseye",
+
+	// Features add extra tools on top of the image. This app needs none,
+	// because the image already has everything. Catalog: https://containers.dev/features
+	// "features": {},
+
+	// Ports to make available on your Mac. "bin/rails server" listens on port 3000
+	// inside the container. VS Code connects to it from inside the container and
+	// passes it to http://localhost:3000 on your Mac.
+	// This is different from "docker run --publish": the server can listen on localhost,
+	// it does not need 0.0.0.0. You can add more ports later in VS Code's Ports tab.
+	"forwardPorts": [
+		3000
+	],
+
+	// A command that runs once, after the container is created.
+	// bin/setup installs the gems (bundle install), creates the SQLite database
+	// (bin/rails db:prepare) and clears old logs and temporary files.
+	"postCreateCommand": "./bin/setup"
+
+	// VS Code settings and extensions for the container, for example:
+	// "customizations": { "vscode": { "extensions": ["Shopify.ruby-lsp"] } },
+
+	// Uncomment to connect as root instead. The default "vscode" user is safer.
+	// More info: https://aka.ms/dev-containers-non-root
+	// "remoteUser": "root"
+}
