@@ -89,6 +89,23 @@
     - [Dependabot: automatic updates](#dependabot-automatic-updates)
     - [Why there is no dev container at the root](#why-there-is-no-dev-container-at-the-root)
     - [When to use a dev container](#when-to-use-a-dev-container)
+11. [App 8: mongo-app](#app-8-mongo-app)
+    - [The app: a counter stored in MongoDB](#the-app-a-counter-stored-in-mongodb)
+    - [The mongo-app Dockerfile](#the-mongo-app-dockerfile)
+    - [What is a Docker network?](#what-is-a-docker-network)
+    - [Network drivers](#network-drivers)
+    - [The default bridge and user-defined bridges](#the-default-bridge-and-user-defined-bridges)
+    - [Create a bridge network: docker network create](#create-a-bridge-network-docker-network-create)
+    - [Run MongoDB and the app on the network](#run-mongodb-and-the-app-on-the-network)
+    - [How the app finds the database: Docker's DNS](#how-the-app-finds-the-database-dockers-dns)
+    - [Look at a network: docker network inspect](#look-at-a-network-docker-network-inspect)
+    - [Published ports and networks](#published-ports-and-networks)
+    - [Networks keep containers apart](#networks-keep-containers-apart)
+    - [Connect and disconnect a running container](#connect-and-disconnect-a-running-container)
+    - [Managing networks](#managing-networks)
+    - [Keep the database data: a volume for /data/db](#keep-the-database-data-a-volume-for-datadb)
+    - [Problems and fixes](#problems-and-fixes)
+    - [When to use a bridge network](#when-to-use-a-bridge-network)
 
 ---
 
@@ -137,15 +154,21 @@ my_project/
 ├── docker-volume/                       # App 7: a counter that keeps its data in a volume
 │   ├── Dockerfile
 │   └── index.js
-└── dev-containers/                      # Section 10: a Rails app you work on in a dev container
-    ├── .devcontainer/
-    │   └── devcontainer.json            # how VS Code builds the dev container
-    ├── .github/
-    │   └── dependabot.yml               # Dependabot settings (no effect in this repository, see section 10)
-    ├── Dockerfile                       # production image, not used by the dev container
-    ├── Gemfile, Gemfile.lock            # Ruby version and gems
-    ├── bin/setup                        # runs once, after the dev container is created
-    └── app/, config/, db/, ...          # the Rails app
+├── dev-containers/                      # Section 10: a Rails app you work on in a dev container
+│   ├── .devcontainer/
+│   │   └── devcontainer.json            # how VS Code builds the dev container
+│   ├── .github/
+│   │   └── dependabot.yml               # Dependabot settings (no effect in this repository, see section 10)
+│   ├── Dockerfile                       # production image, not used by the dev container
+│   ├── Gemfile, Gemfile.lock            # Ruby version and gems
+│   ├── bin/setup                        # runs once, after the dev container is created
+│   └── app/, config/, db/, ...          # the Rails app
+└── mongo-app/                           # App 8: a Fastify app and MongoDB, connected by a bridge network
+    ├── .dockerignore
+    ├── Dockerfile
+    ├── index.js
+    ├── package.json
+    └── package-lock.json
 ```
 
 `node_modules/` is not committed (see `.gitignore`). In App 2 to App 5, the image installs its own copy during the build.
@@ -2328,3 +2351,551 @@ You do not need one when:
 
 - the project only needs tools you already have, like Docker Desktop for Apps 1 to 7
 - each app already runs in its own image
+
+---
+
+## App 8: mongo-app
+
+All the apps so far ran in **one** container. Real apps often need several: for example, a web server and a database. This app, in the `mongo-app/` folder, runs in two containers:
+
+- `db`: a MongoDB database, from the official `mongo:7` image
+- the app: a Fastify server that counts documents in that database
+
+The two containers must talk to each other. This section shows how, with a **bridge network**.
+
+### The app: a counter stored in MongoDB
+
+```js
+const fastify = require("fastify")({ logger: true });
+const { MongoClient } = require("mongodb");
+const url = process.env.MONGO_CONNECTION_STRING || "mongodb://localhost:27017";
+const dbName = "dockerApp";
+const collectionName = "count";
+
+async function start() {
+  const client = await MongoClient.connect(url);
+  const db = client.db(dbName);
+  const collection = db.collection(collectionName);
+
+  fastify.get("/", async function handler(request, reply) {
+    const count = await collection.countDocuments();
+    return { success: true, count };
+  });
+
+  fastify.get("/add", async function handler(request, reply) {
+    const res = await collection.insertOne({});
+    return { acknowledged: res.acknowledged };
+  });
+
+  fastify.listen({ port: 8080, host: "0.0.0.0" }, (err) => {
+    if (err) {
+      fastify.log.error(err);
+      process.exit(1);
+    }
+  });
+}
+
+start().catch((err) => {
+  console.log(err);
+  process.exit(1);
+});
+```
+
+| Part | What it does |
+| --- | --- |
+| `require("mongodb")` | The official MongoDB driver for Node.js. It is in `package.json`, next to `fastify`. |
+| `process.env.MONGO_CONNECTION_STRING` | The address of the database. It comes from an [environment variable](#environment-variables---env), so you can change it with `--env` and not rebuild the image. If it is not set, the app uses `mongodb://localhost:27017`. |
+| `MongoClient.connect(url)` | Connects to MongoDB **before** the server starts. If the database cannot be found, `connect` fails, `.catch` prints the error and the app stops with `process.exit(1)`. |
+| `client.db("dockerApp")` | Selects the database `dockerApp`. MongoDB creates it when the first document is written. |
+| `db.collection("count")` | Selects the collection `count` (a collection is like a table). |
+| `GET /` | Returns how many documents are in the collection: `{"success":true,"count":2}`. |
+| `GET /add` | Adds one empty document (`{}`), so the count goes up by 1: `{"acknowledged":true}`. |
+| `host: "0.0.0.0"` | Accepts connections from the Docker network, not only from inside the container. See [Why host 0.0.0.0?](#why-host-0000). |
+
+It is the same idea as the [App 7 counter](#the-app-a-counter-that-saves-to-a-file), but the number lives in a database in **another container**, not in a file.
+
+#### Why the default URL does not work in a container
+
+`mongodb://localhost:27017` is correct when Node.js and MongoDB both run on your Mac. In a container, **`localhost` is the container itself**. MongoDB is not in the app's container, so the app must use the database container's **name** instead: `mongodb://db:27017`. The rest of this section explains why that name works.
+
+### The mongo-app Dockerfile
+
+```dockerfile
+FROM node:20
+
+USER node
+
+RUN mkdir /home/node/code
+
+WORKDIR /home/node/code
+
+COPY --chown=node:node package-lock.json package.json ./
+
+RUN npm ci
+
+COPY --chown=node:node . .
+
+CMD ["node", "index.js"]
+```
+
+This is the [App 2 Dockerfile](#how-this-dockerfile-works) with a different `CMD`:
+
+- `USER node`: runs as the built-in non-root `node` user. See [Running as a non-root user](#running-as-a-non-root-user).
+- `RUN mkdir` and `WORKDIR`: makes `/home/node/code` and uses it as the current directory. The folder is made **after** `USER node`, so `node` owns it and `npm ci` can write `node_modules` there.
+- `COPY` the package files first, then `RUN npm ci`, then `COPY` the rest. This keeps the slow `npm ci` step in the build cache when only `index.js` changes. See [Faster builds](#faster-builds-copy-package-files-first).
+- `CMD ["node", "index.js"]`: starts the server.
+
+#### The .dockerignore
+
+`mongo-app/` has a `node_modules/` folder, from `npm install` on your Mac. Without a `.dockerignore`, the last `COPY . .` copies the Mac's `node_modules` **over** the one that `npm ci` made in the image. Packages with native code are built for macOS, so they do not work on Linux. See [Leaving files out: .dockerignore](#leaving-files-out-dockerignore).
+
+`mongo-app/.dockerignore` stops this:
+
+```
+node_modules
+npm-debug.log*
+.git
+```
+
+### What is a Docker network?
+
+A container has its own network stack: its own IP address, its own `localhost` and its own ports. A **Docker network** is a virtual network that connects containers to each other, like a network switch in an office connects computers.
+
+- A container can be on **zero, one or more** networks.
+- Containers on the **same** network can talk to each other.
+- Containers on **different** networks cannot, unless one of them is on both.
+- Your Mac reaches a container only through a [published port](#why---publish) (`-p`).
+
+On Docker Desktop for Mac, all of this happens inside Docker's Linux virtual machine. The container IP addresses (like `172.19.0.2`) are not on your Mac's network, so you cannot `ping` them from your Mac.
+
+### Network drivers
+
+Each network has a **driver**. The driver decides how the network works. Docker comes with these:
+
+| Driver | What it does | When to use it |
+| --- | --- | --- |
+| `bridge` | A private network on one Docker host. Containers on it get their own IP addresses. **The default driver.** | Containers on one machine that must talk to each other. This app. |
+| `host` | No separate network: the container uses the host's network directly. `-p` is not needed (and is ignored). | Rare. On Docker Desktop for Mac, the "host" is the Linux VM, not your Mac. |
+| `none` | No network at all, only `localhost`. | Containers that must not use the network, like a batch job on secret data. |
+| `overlay` | One network across **several** Docker hosts. | Docker Swarm clusters. |
+| `macvlan`, `ipvlan` | The container gets an address on your real (physical) network, like another computer. | Old software that expects to be on the real network. |
+
+Docker makes three networks when it is installed:
+
+```
+$ docker network ls
+NETWORK ID     NAME            DRIVER    SCOPE
+52f144354f73   bridge          bridge    local
+0760f76251e6   host            host      local
+7136af62be09   none            null      local
+```
+
+`SCOPE local` means the network exists only on this Docker host. You cannot remove these three networks.
+
+### The default bridge and user-defined bridges
+
+There are two kinds of bridge network:
+
+- **The default bridge**: the network called `bridge`. Docker puts every container there when you do not give `--network`. All the apps so far used it.
+- **A user-defined bridge**: a bridge network **you** create, with `docker network create`.
+
+They use the same driver, but they do not work the same:
+
+| | Default `bridge` | User-defined bridge (`app-net`) |
+| --- | --- | --- |
+| Find another container by **name** | **No.** Only by IP address. | **Yes.** Docker has a built-in DNS server. |
+| Who is on it | Every container started without `--network`, including ones from unrelated projects. | Only the containers you put on it. |
+| Settings (subnet, gateway, ...) | Shared by all containers. Changing them needs a restart of Docker. | Per network, set when you create it. |
+| Subnet measured here | `172.17.0.0/16` | `172.19.0.0/16`, `172.20.0.0/16`, ... (the next free one) |
+
+**The most important difference is DNS.** Measured on this project, with a MongoDB container called `demo-db-default` on the default bridge:
+
+```
+$ docker run --rm alpine ping -c1 -W2 demo-db-default
+ping: bad address 'demo-db-default'
+
+$ docker inspect demo-db-default --format '{{.NetworkSettings.Networks.bridge.IPAddress}}'
+172.17.0.2
+
+$ docker run --rm alpine ping -c1 -W2 172.17.0.2
+PING 172.17.0.2 (172.17.0.2): 56 data bytes
+64 bytes from 172.17.0.2: seq=0 ttl=64 time=0.156 ms
+```
+
+The network works (the IP address answers), but the **name** is unknown. The app fails the same way:
+
+```
+$ docker run --rm -e MONGO_CONNECTION_STRING=mongodb://demo-db-default:27017 my-app-with-mongo
+... getaddrinfo ENOTFOUND demo-db-default
+```
+
+You could use the IP address in the connection string, but Docker gives a new address each time the container is re-created. The address can change; the name does not. So **always create your own bridge network** when containers must talk to each other.
+
+**Note:** old tutorials use `--link` to connect containers on the default bridge. `--link` is a legacy feature. Use a user-defined network.
+
+### Create a bridge network: docker network create
+
+```sh
+docker network create --driver bridge app-net
+```
+
+| Part | What it does |
+| --- | --- |
+| `docker network create` | Creates a new network and prints its ID. |
+| `--driver bridge` | Uses the bridge driver. `bridge` is the default, so `docker network create app-net` does the same. Write it out while you learn: it shows what you get. Short form: `-d bridge`. |
+| `app-net` | The network's name. You use it with `--network app-net`. |
+
+Measured here:
+
+```
+$ docker network create --driver bridge demo-net
+60d0b40bd62d654be23927c6ba7b4e054ed2c0d4bfe79ffd833e4de0ebe2939b
+
+$ docker network ls --filter name=demo-net
+NETWORK ID     NAME       DRIVER    SCOPE
+60d0b40bd62d   demo-net   bridge    local
+```
+
+#### Options for docker network create
+
+Docker chooses a free subnet for you. You can also choose it:
+
+```sh
+docker network create --driver bridge --subnet 10.10.0.0/24 --gateway 10.10.0.1 demo-custom
+docker run --rm --network demo-custom --ip 10.10.0.50 alpine ip -4 addr show eth0
+#    inet 10.10.0.50/24 brd 10.10.0.255 scope global eth0
+```
+
+| Option | What it does |
+| --- | --- |
+| `--subnet 10.10.0.0/24` | The range of IP addresses on the network. `/24` means 256 addresses, `10.10.0.0` to `10.10.0.255`. |
+| `--gateway 10.10.0.1` | The address of the bridge itself. Containers send traffic for other networks (like the internet) to it. |
+| `--ip-range 10.10.0.128/25` | Gives containers addresses only from this part of the subnet. |
+| `--internal` | Containers on the network can talk to each other, but **not** to the internet. Good for a database that never needs to go out. |
+| `--label project=docker-basics` | Adds a label, so you can filter with `docker network ls --filter label=project=docker-basics`. |
+
+`docker run --ip` gives a container a fixed address. It works **only** on a user-defined network with a `--subnet`. You rarely need it: use names.
+
+### Run MongoDB and the app on the network
+
+The full steps, from the start.
+
+**1. Create the network:**
+
+```sh
+docker network create --driver bridge app-net
+```
+
+**2. Start MongoDB on it:**
+
+```sh
+docker run -d --name db --network app-net mongo:7
+```
+
+| Part | What it does |
+| --- | --- |
+| `-d` | Runs in the background (`--detach`). |
+| `--name db` | Names the container `db`. **On a user-defined network, this name is also its DNS name.** Other containers on `app-net` reach it as `db`. |
+| `--network app-net` | Puts the container on `app-net`, not on the default bridge. Short form: `--net app-net`. |
+| `mongo:7` | The official MongoDB 7 image. MongoDB listens on port `27017`. |
+
+There is no `-p`. The app reaches MongoDB over `app-net`, so the database does not need a port on your Mac. See [Published ports and networks](#published-ports-and-networks).
+
+**3. Build the app image:**
+
+```sh
+cd mongo-app
+docker build . -t my-app-with-mongo
+```
+
+**4. Start the app on the same network:**
+
+```sh
+docker run -d --init --name app --network app-net -p 8080:8080 \
+  --env MONGO_CONNECTION_STRING=mongodb://db:27017 my-app-with-mongo
+```
+
+| Part | What it does |
+| --- | --- |
+| `--network app-net` | The **same** network as `db`. This is what lets the app find the database. |
+| `-p 8080:8080` | Publishes the app's port, so your Mac can open <http://localhost:8080>. |
+| `--env MONGO_CONNECTION_STRING=mongodb://db:27017` | Tells the app where MongoDB is. `db` is the name of the MongoDB container, `27017` is MongoDB's port **inside** that container. |
+| `--init` | Lets `Ctrl+C` and `docker stop` stop Node.js at once. See [Why --init?](#why---init). |
+
+**5. Try it.** Measured on this project:
+
+```
+$ curl localhost:8080/
+{"success":true,"count":0}
+$ curl localhost:8080/add
+{"acknowledged":true}
+$ curl localhost:8080/add
+{"acknowledged":true}
+$ curl localhost:8080/
+{"success":true,"count":2}
+```
+
+The request goes from your Mac to the app (through the published port), and from the app to `db` (through `app-net`):
+
+```
+your Mac                       Docker Desktop (Linux VM)
+                               ┌─ app-net: bridge, 172.19.0.0/16 ──────────────┐
+curl localhost:8080 ─────────▶ │  app (172.19.0.3:8080)                        │
+       -p 8080:8080            │    │                                          │
+                               │    │ mongodb://db:27017                       │
+                               │    ▼   (Docker DNS: db = 172.19.0.2)         │
+                               │  db  (172.19.0.2:27017, not published)       │
+                               └───────────────────────────────────────────────┘
+```
+
+The app's log shows its own address on the network:
+
+```
+{"level":30,..."msg":"Server listening at http://127.0.0.1:8080"}
+{"level":30,..."msg":"Server listening at http://172.19.0.3:8080"}
+```
+
+### How the app finds the database: Docker's DNS
+
+On a user-defined network, every container uses Docker's built-in **DNS server** at the address `127.0.0.11`. It knows the name of every container on the network. Measured on this project:
+
+```
+$ docker run --rm --network demo-net alpine cat /etc/resolv.conf
+nameserver 127.0.0.11
+options ndots:0
+
+$ docker run --rm --network demo-net alpine nslookup demo-db 127.0.0.11
+Server:     127.0.0.11
+Address:    127.0.0.11:53
+
+Name:   demo-db
+Address: 172.20.0.2
+```
+
+So when the app connects to `mongodb://db:27017`:
+
+1. The MongoDB driver asks the DNS server for the address of `db`.
+2. Docker's DNS answers with `db`'s current IP address, for example `172.19.0.2`.
+3. The driver connects to `172.19.0.2:27017`.
+
+On the default bridge, `/etc/resolv.conf` shows a different server (`192.168.65.7` here, from Docker Desktop). That server does not know container names, which is why `ping demo-db-default` failed above.
+
+Names that the DNS server knows:
+
+- the container name (`--name db`)
+- the network aliases (`--network-alias`, see [Network aliases](#network-aliases))
+- the first 12 characters of the container ID
+
+Names are only known **inside the network**. Your Mac does not know the name `db`.
+
+### Look at a network: docker network inspect
+
+```sh
+docker network inspect app-net
+```
+
+The output is long JSON. The important parts:
+
+```json
+"Driver": "bridge",
+"IPAM": {
+    "Config": [{ "Subnet": "172.19.0.0/16", "Gateway": "172.19.0.1" }]
+},
+"Internal": false,
+"Containers": {
+    "...": { "Name": "db",  "IPv4Address": "172.19.0.2/16" },
+    "...": { "Name": "app", "IPv4Address": "172.19.0.3/16" }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `Driver` | `bridge` |
+| `IPAM.Config.Subnet` | The range of addresses for containers. IPAM means "IP address management". |
+| `IPAM.Config.Gateway` | The bridge's own address. It is the route out of the network. |
+| `Internal` | `true` if the network was made with `--internal` (no internet). |
+| `Containers` | Every container on the network, with its address. Addresses are given in order: `.2`, `.3`, ... |
+
+For a short answer, use `--format`:
+
+```
+$ docker network inspect demo-net --format '{{range .IPAM.Config}}{{.Subnet}} gw={{.Gateway}}{{end}} {{range .Containers}}{{.Name}}={{.IPv4Address}} {{end}}'
+172.20.0.0/16 gw=172.20.0.1 demo-app=172.20.0.3/16 demo-db=172.20.0.2/16
+```
+
+To see the networks of one **container**:
+
+```sh
+docker inspect db --format '{{range $name, $net := .NetworkSettings.Networks}}{{$name}}={{$net.IPAddress}} {{end}}'
+# app-net=172.19.0.2
+```
+
+### Published ports and networks
+
+There are two kinds of traffic, and they work differently:
+
+| From | To | How | Port to use |
+| --- | --- | --- | --- |
+| Your Mac | A container | A **published** port: `-p HOST:CONTAINER` | The **host** port, on `localhost`: `localhost:8080` |
+| A container | A container on the same network | Directly, over the network. **No `-p` needed.** | The **container** port, on the container's name: `db:27017` |
+
+So:
+
+- `-p` is only for traffic **from outside Docker**.
+- Between containers, always use the **container's** port. With `-p 27018:27017` on `db`, the app must still use `db:27017`.
+- **Do not publish a database port unless you need it.** Without `-p`, only containers on `app-net` can reach MongoDB. With `-p 27017:27017`, any program on your Mac can reach it too (and, with no `HostIp`, other computers on your Wi-Fi). The `mongo:7` image has **no password** by default.
+
+Publish `27017` only when a tool on your Mac needs the database, for example MongoDB Compass or `mongosh`. Then limit it to your Mac with `-p 127.0.0.1:27017:27017`.
+
+### Networks keep containers apart
+
+A container that is not on the network cannot reach it, not by name and not by IP address. Measured on this project, with `demo-db` on `demo-net` (`172.20.0.2`) and a second network, `demo-other`:
+
+```
+$ docker network create demo-other
+$ docker run --rm --network demo-other alpine ping -c1 -W2 demo-db
+ping: bad address 'demo-db'
+$ docker run --rm --network demo-other alpine ping -c1 -W2 172.20.0.2
+--- 172.20.0.2 ping statistics ---
+1 packets transmitted, 0 packets received, 100% packet loss
+```
+
+This is a security feature. Put a database on a network with only the apps that need it. A common setup has two networks:
+
+```
+frontend-net:  web  ── api
+backend-net:          api ── db
+```
+
+`api` is on both networks. `web` can reach `api`, but it cannot reach `db`.
+
+### Connect and disconnect a running container
+
+You can change a container's networks without stopping it. Measured on this project, with `demo-tool`, a container started on `demo-other`:
+
+```
+$ docker network connect demo-net demo-tool
+$ docker exec demo-tool ping -c1 demo-db
+PING demo-db (172.20.0.2): 56 data bytes
+64 bytes from 172.20.0.2: seq=0 ttl=64 time=0.142 ms
+
+$ docker inspect demo-tool --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}={{$v.IPAddress}} {{end}}'
+demo-net=172.20.0.4 demo-other=172.21.0.2
+
+$ docker network disconnect demo-net demo-tool
+$ docker exec demo-tool ping -c1 -W2 demo-db
+ping: bad address 'demo-db'
+```
+
+- After `connect`, the container is on **two** networks, with one address on each.
+- After `disconnect`, it loses the address and the names on that network at once.
+
+This is how you can fix a container that you started on the wrong network, for example the default bridge:
+
+```sh
+docker network connect app-net app
+docker network disconnect bridge app
+```
+
+Measured here: after these two commands, the container was only on the new network.
+
+#### Network aliases
+
+An **alias** is an extra DNS name on one network:
+
+```sh
+docker run -d --name db --network app-net --network-alias mongo mongo:7
+# or, for a running container:
+docker network connect --alias mongo app-net db
+```
+
+Now `mongodb://db:27017` and `mongodb://mongo:27017` both work. Measured here: after `docker network connect --alias mongo demo-net demo-tool`, `ping mongo` went to `demo-tool`'s address `172.20.0.4`.
+
+If several containers have the same alias, the DNS server answers with all their addresses. That is a simple way to share requests between copies of a service.
+
+### Managing networks
+
+| Command | What it does |
+| --- | --- |
+| `docker network ls` | Lists all networks. |
+| `docker network ls --filter driver=bridge` | Lists only bridge networks. |
+| `docker network create --driver bridge NAME` | Creates a bridge network. |
+| `docker network inspect NAME` | Shows the settings and the containers of a network. |
+| `docker network connect NAME CONTAINER` | Adds a running container to a network. |
+| `docker network disconnect NAME CONTAINER` | Removes a container from a network. |
+| `docker network rm NAME` | Deletes a network. |
+| `docker network prune` | Deletes **all** networks that no container uses. It asks first; add `-f` to skip the question. It never deletes `bridge`, `host` or `none`. |
+
+You cannot delete a network that a **running** container is on. Measured here:
+
+```
+$ docker network rm demo-net
+Error response from daemon: error while removing network: network demo-net id 60d0b40bd62d... has active endpoints
+```
+
+A **stopped** container does not block `docker network rm`. But the container still points to the deleted network, so it cannot start again. Measured here:
+
+```
+$ docker start t-stopped2
+Error response from daemon: network 159af946466f... not found
+Error: failed to start containers: t-stopped2
+```
+
+So remove the containers first (or `disconnect` them), then the network:
+
+```sh
+docker rm -f app db
+docker network rm app-net
+```
+
+`docker rm` does **not** delete networks, and `docker network rm` does not delete containers. Each one is a separate object, like [volumes](#volumes).
+
+### Keep the database data: a volume for /data/db
+
+MongoDB saves its files in `/data/db`. The `mongo:7` image declares `/data/db` and `/data/configdb` as volumes, so `docker run mongo:7` makes two **anonymous** volumes, with random names like `460b0c954ef6...`. Measured here with `docker inspect db --format '{{json .Mounts}}'`.
+
+Anonymous volumes are hard to find again. When you delete `db` and start a new one, it gets **new**, empty volumes, and the count goes back to `0`. Use a named volume, as in [App 7](#app-7-docker-volume):
+
+```sh
+docker run -d --name db --network app-net \
+  --mount type=volume,src=mongo-data,target=/data/db mongo:7
+```
+
+Now you can delete and re-create `db`, and the data stays. The new `db` can get a different IP address, but the app still finds it by name.
+
+A network and a volume do different jobs:
+
+| | Network | Volume |
+| --- | --- | --- |
+| Connects | containers to **containers** | a container to **stored files** |
+| Survives `docker rm` | Yes | Yes |
+| Here | `app-net`: the app reaches `db` | `mongo-data`: MongoDB keeps its data |
+
+### Problems and fixes
+
+| What you see | Why | Fix |
+| --- | --- | --- |
+| `MongoServerSelectionError` with `getaddrinfo ENOTFOUND db` | The app cannot find the name `db`. Either a container is on the default bridge, or the two are on different networks. | Start both with `--network app-net`. Check with `docker network inspect app-net`. |
+| `MongoServerSelectionError` with `connect ECONNREFUSED 127.0.0.1:27017` | `MONGO_CONNECTION_STRING` is not set, so the app uses `localhost`, which is the app's own container. | Add `--env MONGO_CONNECTION_STRING=mongodb://db:27017`. |
+| `MongoServerSelectionError` with `ECONNREFUSED 172.19.0.2:27017` | The name is found, but MongoDB does not answer: it is still starting, or the port is wrong. | Check `docker ps` and `docker logs db`. Use the container port (`27017`), not the published port. |
+| The app container stops at once | `MongoClient.connect` failed, and the app called `process.exit(1)`. | Read `docker logs app`. Start `db` before the app, or add `--restart on-failure` to the app so Docker starts it again. |
+| `localhost:8080` does not connect | The app's port is not published. | Add `-p 8080:8080` to the **app**. |
+| `network ... has active endpoints` | A running container is still on the network. | `docker rm` or `docker network disconnect` the containers first. |
+| `network ... not found` on `docker start` | The container's network was deleted. | `docker network connect` it to an existing network, or re-create it. |
+
+The MongoDB errors do **not** appear at once. The driver tries for 30 seconds (its `serverSelectionTimeoutMS` setting), then `connect` fails. Measured here: both the `ENOTFOUND` and the `ECONNREFUSED 127.0.0.1` cases stopped the app after 31 seconds. While you test, you can make it shorter with `mongodb://db:27017/?serverSelectionTimeoutMS=3000`.
+
+### When to use a bridge network
+
+Use a user-defined bridge network when:
+
+- two or more containers on the same machine must talk to each other, like an app and its database
+- you want to use container **names**, not IP addresses
+- you want to keep containers apart, for example a database that only the API can reach
+
+You do not need one when:
+
+- the container only talks to your Mac, like Apps 1 to 7: `-p` is enough
+- the containers run on several machines: use an `overlay` network
+
+**Next step:** Docker Compose does all of this for you. It reads one `compose.yaml` file, creates a bridge network for the project, and starts every service on it, with the service names as DNS names.
