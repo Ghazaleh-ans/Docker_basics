@@ -14,5 +14,3 @@ npm-debug.log*
 # Editors
 .vscode/
 .idea/
-docker-compose/web/dist/
-kubernetes/web/dist/
