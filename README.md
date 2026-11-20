@@ -131,6 +131,8 @@
     - [kubectl: the Kubernetes CLI](#kubectl-the-kubernetes-cli)
     - [A local cluster: Docker Desktop or minikube](#a-local-cluster-docker-desktop-or-minikube)
     - [Contexts: switch between clusters](#contexts-switch-between-clusters)
+    - [Kompose: from Compose to Kubernetes](#kompose-from-compose-to-kubernetes)
+    - [kubectl commands: get, apply, scale, delete](#kubectl-commands-get-apply-scale-delete)
     - [Problems and fixes (Kubernetes)](#problems-and-fixes-kubernetes)
 
 ---
@@ -195,18 +197,23 @@ my_project/
 │   ├── index.js
 │   ├── package.json
 │   └── package-lock.json
-└── docker-compose/                      # App 9: web + api + db, started by one Compose file
-    ├── docker-compose.yml               # the three services
-    ├── api/                             # Fastify API (the App 8 app, plus CORS)
-    │   ├── Dockerfile
-    │   ├── index.js
-    │   ├── package.json
-    │   └── package-lock.json
-    └── web/                             # React page, built by Parcel, served by nginx
-        ├── Dockerfile
-        ├── package.json
-        ├── package-lock.json
-        └── src/                         # index.html, web.jsx, style.css
+├── docker-compose/                      # App 9: web + api + db, started by one Compose file
+│   ├── docker-compose.yml               # the three services
+│   ├── api/                             # Fastify API (the App 8 app, plus CORS)
+│   │   ├── Dockerfile
+│   │   ├── index.js
+│   │   ├── package.json
+│   │   └── package-lock.json
+│   └── web/                             # React page, built by Parcel, served by nginx
+│       ├── Dockerfile
+│       ├── package.json
+│       ├── package-lock.json
+│       └── src/                         # index.html, web.jsx, style.css
+└── kubernetes/                          # Section 13: App 9 converted to Kubernetes by Kompose
+    ├── docker-compose.yml               # Kompose input, with kompose.* labels
+    ├── api/                             # the App 9 API, routes under /api
+    ├── web/                             # the App 9 page, plus nginx.conf that proxies /api
+    └── *-deployment.yaml, *-service.yaml  # written by kompose convert --build local
 ```
 
 `node_modules/` is not committed (see `.gitignore`). In App 2 to App 5, the image installs its own copy during the build.
@@ -3596,10 +3603,450 @@ kubectl get nodes
 
 You see one node, named `docker-desktop` or `minikube`, with the status `Ready`. A local cluster has one node that is the control plane and the worker at the same time.
 
+### Kompose: from Compose to Kubernetes
+
+**Kompose** is a tool that converts a `docker-compose.yml` file into Kubernetes files. You give it the Compose file you already have. It writes one Deployment and one Service for each Compose service.
+
+**What it is for:** you already know Compose, and the [App 9](#app-9-docker-compose) project already has a working Compose file. With Kompose, you do not write the Kubernetes YAML by hand to get the same project into a cluster. Use the output as a **first draft**: read it, learn from it, and change it when you need more. Kompose is a migration and learning tool. For a real production setup, you usually keep and edit the Kubernetes files, not the Compose file.
+
+Install it on macOS with `brew install kompose`. See [kompose.io](https://kompose.io/) for other systems. Measured here:
+
+```
+$ kompose version
+1.38.0 (HEAD)
+```
+
+#### The kubernetes folder
+
+The `kubernetes/` folder is a copy of App 9 with a few changes for Kubernetes, plus the files that Kompose wrote:
+
+```
+kubernetes/
+├── docker-compose.yml       # the input: App 9's Compose file, with kompose.* labels
+├── api/                     # the Fastify API (routes are now /api and /api/add)
+├── web/                     # the React page, served by nginx
+│   └── nginx.conf           # new: serves the page, and sends /api to the api Service
+├── api-deployment.yaml      # written by Kompose
+├── api-service.yaml         # written by Kompose
+├── db-deployment.yaml       # written by Kompose
+├── db-service.yaml          # written by Kompose
+├── web-deployment.yaml      # written by Kompose
+└── web-tcp-service.yaml     # written by Kompose
+```
+
+#### How Kompose converts each part
+
+| In `docker-compose.yml` | What Kompose writes |
+| --- | --- |
+| A service (`api`, `db`, `web`) | A **Deployment** with that name, `replicas: 1` |
+| `image: mongo:7` | `image: mongo:7` in the Deployment |
+| `build: api` | With `--build local`: Kompose runs `docker build` and names the image after the service (`api`, `web`) |
+| `ports: "8080:8080"` | `containerPort: 8080` in the Deployment, **and** a **Service** with `port: 8080` |
+| No `ports:` | **No Service**. Kompose prints `Service "db" won't be created because 'ports' is not specified` |
+| `environment:` | `env:` in the container |
+| `labels:` that start with `kompose.` | Settings for Kompose (see below). They are also copied as `annotations` |
+| `depends_on`, `links` | Nothing. Kubernetes has no start order. Pods that need another pod must retry until it is ready |
+
+Each object also gets the label `io.kompose.service: <name>`. The Service uses it as its `selector`: it sends traffic to the pods that have the same label.
+
+The Service has **the same name** as the Compose service. So the API still finds MongoDB at `mongodb://db:27017`, and nginx still finds the API at `http://api:8080`. In Compose, Docker's DNS gave those names; in Kubernetes, the cluster DNS gives them to the Services.
+
+#### Convert the project
+
+Run this in the `kubernetes/` folder:
+
+```sh
+kompose convert --build local
+```
+
+- `convert` reads `docker-compose.yml` and writes the `*-deployment.yaml` and `*-service.yaml` files.
+- `--build local` also builds the `api` and `web` images with your local Docker. Measured here: images `api:latest` (1.12 GB) and `web:latest` (54.5 MB).
+
+Each file records the command and version that wrote it, in `kompose.cmd` and `kompose.version`.
+
+#### Changes from App 9
+
+In App 9, the browser called the API directly at `localhost:8080`. Here the browser calls **only the web Service**, and nginx passes the API calls on:
+
+```
+browser ──▶ web-tcp Service :8081 ──▶ web pod (nginx :80)
+                                         ├── /       → the React page
+                                         └── /api/*  → api Service :8080 ──▶ api pod ──▶ db Service :27017 ──▶ db pod
+```
+
+- `web/nginx.conf` (new): `location /api { proxy_pass http://api:8080; }`.
+- `web/Dockerfile`: copies `nginx.conf` and sets `API_URL=http://localhost:8081/api` for the Parcel build.
+- `api/index.js`: the routes are `/api` and `/api/add`, because nginx passes the full path on.
+- `db` now has `ports: "27017:27017"`, so that Kompose makes a `db` Service. Without it, the API cannot find the database.
+
+#### Kompose labels
+
+You control Kompose with `labels:` on each Compose service. Docker Compose ignores these labels, so the same file still works with `docker compose up`.
+
+##### kompose.service.type
+
+This label chooses the **type of the Kubernetes Service**: who can reach it, and how.
+
+| Value | Service type | Who can reach it |
+| --- | --- | --- |
+| (no label) | `ClusterIP` | Only pods in the cluster. This is the default. |
+| `nodeport` | `NodePort` | Pods, **and** anyone who can reach a node, on a port from 30000 to 32767 |
+| `LoadBalancer` | `LoadBalancer` | Pods, node ports, **and** an external address from a load balancer |
+| `headless` | `ClusterIP: None` | No single address; DNS returns each pod's IP. For databases with several pods. |
+
+Kompose does not care about upper or lower case: `nodeport`, `NodePort` and `NODEPORT` all work.
+
+Each type includes the one above it: a `LoadBalancer` Service also has a cluster IP and a node port. Measured here:
+
+```
+$ kubectl get services
+NAME         TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)          AGE
+api          NodePort       10.98.233.166   <none>        8080:30306/TCP   8m25s
+db           ClusterIP      10.111.17.215   <none>        27017/TCP        8m25s
+kubernetes   ClusterIP      10.96.0.1       <none>        443/TCP          26m
+web-tcp      LoadBalancer   10.109.208.85   <pending>     8081:31150/TCP   8m25s
+```
+
+`8080:30306` means: port `8080` on the Service's cluster IP, and port `30306` on every node.
+
+##### kompose.service.type: LoadBalancer (web)
+
+```yaml
+web:
+  labels:
+    kompose.service.type: LoadBalancer
+```
+
+A **LoadBalancer** Service asks the platform for one **external** address, and spreads the requests over the pods behind it. This is how users outside the cluster reach your app. The `web` service is the front door of the project, so it gets this type.
+
+- **In the cloud** (AWS, Google Cloud, Azure): the cloud makes a real load balancer with a public IP. It shows in `EXTERNAL-IP`. The cloud charges you for it.
+- **On Docker Desktop**: there is no cloud. Docker Desktop publishes the Service on `localhost`, on the Service's port. Here that is `http://localhost:8081`.
+- **On minikube**: `EXTERNAL-IP` stays `<pending>` until you run `minikube tunnel` in a second terminal. Or open it with `minikube service web-tcp`.
+
+**Why is it called `web-tcp`, not `web`?** For a LoadBalancer, Kompose makes one Service for each protocol (`-tcp`, `-udp`), because older Kubernetes versions did not allow TCP and UDP in one LoadBalancer. The Deployment is still called `web`. The `selector` is `io.kompose.service: web`, so `web-tcp` still finds the web pods.
+
+`web` also has `kompose.service.expose: true`. This label asks Kompose to make an **Ingress** (an HTTP router for the cluster). Kompose makes **no** Ingress when the type is `LoadBalancer`, so here this label has no effect. Measured: with `kompose.service.type: clusterip`, the same file gives `kind: Ingress, name: web` and a Service called `web`.
+
+##### kompose.service.type: nodeport (api)
+
+```yaml
+api:
+  labels:
+    kompose.service.type: nodeport
+    # kompose.service.nodeport.port: "8080"
+```
+
+A **NodePort** Service opens the **same port on every node** of the cluster. Traffic to `<any node IP>:<node port>` goes to the Service, then to one of its pods.
+
+- Kubernetes picks the port from **30000 to 32767**. Here it picked `30306`. On Docker Desktop, node ports are published on `localhost`, so this works:
+
+  ```
+  $ curl localhost:30306/api
+  {"success":true,"count":0}
+  ```
+
+- To choose the port yourself, use `kompose.service.nodeport.port`. It must be in the range. This is why the line with `"8080"` is a comment. Kompose writes `nodePort: 8080` without a warning, but the cluster refuses it. Measured here:
+
+  ```
+  Service "np-range-test" is invalid: spec.ports[0].nodePort: Invalid value: 8080:
+  provided port is not in the valid range. The range of valid ports is 30000-32767
+  ```
+
+  Use, for example, `kompose.service.nodeport.port: "30080"`.
+
+The browser does not need the node port, because the browser calls `web`, and nginx calls `api:8080` inside the cluster. NodePort is useful here to **test the API alone** from your Mac. With no label, `api` would be a `ClusterIP` Service, like `db`, and the app would work the same.
+
+| | NodePort | LoadBalancer |
+| --- | --- | --- |
+| Address | `<node IP>:30000-32767` | One external IP (or `localhost` on Docker Desktop), on the normal port |
+| Needs | Nothing extra | A cloud provider, Docker Desktop, or `minikube tunnel` |
+| Cost in the cloud | Free | You pay for each load balancer |
+| Good for | Tests, local clusters, your own load balancer in front | The public entry of an app in the cloud |
+
+##### db: no label, so ClusterIP
+
+`db` has no `kompose.service.type`, so it gets the default, **ClusterIP**. Only the pods in the cluster can reach it, at `db:27017`. This is correct for a database: the API must reach it, but nobody outside should. The `27017:27017` in the Compose file only makes Kompose create the Service. It does **not** publish the database on your Mac, as it did in Compose.
+
+##### kompose.image-pull-policy: Never
+
+```yaml
+labels:
+  kompose.image-pull-policy: Never
+```
+
+Kompose writes this as `imagePullPolicy: Never` on the container. The **pull policy** tells Kubernetes when to download the image from a registry:
+
+| Policy | What Kubernetes does |
+| --- | --- |
+| `Always` | Downloads the image each time a pod starts. The default for `:latest` or no tag. |
+| `IfNotPresent` | Uses the local image if it is there. Downloads it only if it is missing. The default for other tags, like `mongo:7`. |
+| `Never` | **Never** downloads. Uses only the image that is already on the node. The pod fails if it is not there. |
+
+**Why `Never` is necessary here:** `kompose convert --build local` builds `api` and `web` on your Mac and does **not** push them to a registry. The image names have no tag, so they are `:latest`, and the default policy is `Always`. Kubernetes would then try to download `docker.io/library/api:latest`, which does not exist, and the pod would stay in `ErrImagePull` or `ImagePullBackOff`.
+
+With `Never`, Kubernetes uses the image that you built. This works on **Docker Desktop**, because its Kubernetes uses the same Docker engine as your terminal (`CONTAINER-RUNTIME docker://20.10.23` in `kubectl get nodes -o wide`). So it sees the images from `docker images`.
+
+- **minikube** has its own Docker engine. Build the images there: run `eval $(minikube docker-env)` before `kompose convert --build local`, or copy them in with `minikube image load api web`.
+- **A real cluster** has no copy of your local images. Push them to a registry and remove `Never`.
+
+`db` has no label, so `mongo:7` uses `IfNotPresent` and is downloaded from Docker Hub.
+
+#### Run it on the cluster
+
+In the `kubernetes/` folder:
+
+```sh
+# Create everything from the Kompose files (see "kubectl apply" below)
+kubectl apply -f '*.yaml'
+
+# Check the pods, Deployments and Services
+kubectl get all
+
+# Open the app
+open http://localhost:8081
+
+# Delete only what these files created
+kubectl delete -f '*.yaml'
+```
+
+See [kubectl commands](#kubectl-commands-get-apply-scale-delete) for what each command does.
+
+When you change the Compose file, run `kompose convert --build local` again, then `kubectl apply` again. Kompose overwrites the `.yaml` files, so changes that you made in them by hand are lost.
+
+If `localhost:8081` does not work, use port forwarding. It does not need a load balancer:
+
+```sh
+kubectl port-forward service/web-tcp 18081:8081
+# then open http://localhost:18081
+```
+
+### kubectl commands: get, apply, scale, delete
+
+All the examples below use the Kompose project in `kubernetes/`. Run them in that folder.
+
+kubectl sends every command to the **current context** (see [Contexts](#contexts-switch-between-clusters)) and the **current namespace** (`default` unless you change it). Check `kubectl config current-context` before you change or delete things.
+
+| Command | What it does |
+| --- | --- |
+| `kubectl apply -f 'x.yaml'` | Creates or updates the objects in a file so that they match it |
+| `kubectl get all` | Lists the pods, Services, Deployments and ReplicaSets in the namespace |
+| `kubectl scale --replicas=5 deployment/api` | Changes the number of pods of a Deployment, now |
+| `kubectl delete all --all` | Deletes **all** of those objects in the namespace. Be careful. |
+
+#### kubectl apply -f 'x.yaml'
+
+`apply` is **declarative**: the file describes the state you want, and Kubernetes changes the cluster to match it. You can run the same command many times:
+
+- the object does not exist: it is **created**
+- the object exists and the file changed: it is **updated** (`configured`)
+- nothing changed: `unchanged`, and nothing happens
+
+The first time, each line ends in `created`. Measured here, when everything already ran:
+
+```
+$ kubectl apply -f '*.yaml'
+deployment.apps/api unchanged
+service/api unchanged
+deployment.apps/db unchanged
+service/db unchanged
+deployment.apps/web unchanged
+service/web-tcp unchanged
+```
+
+Ways to give the files:
+
+| Form | What it reads |
+| --- | --- |
+| `-f api-deployment.yaml` | One file |
+| `-f api-deployment.yaml -f api-service.yaml` or `-f a.yaml,b.yaml` | Several files |
+| `-f '*.yaml'` | Every file that matches the pattern. **kubectl** expands the pattern, not your shell. |
+| `-f .` or `-f k8s/` | Every `.yaml`, `.yml` and `.json` file in the folder |
+| `-f https://...` | A file from a URL |
+
+**Why the quotes in `'x.yaml'`?** Without quotes, zsh expands `*.yaml` before kubectl runs, and stops with `no matches found` if nothing matches. With quotes, kubectl gets the pattern and expands it itself. For one plain file name, the quotes change nothing.
+
+`'*.yaml'` is useful in `kubernetes/`: it reads the six Kompose files, but **not** `docker-compose.yml` (that ends in `.yml`). `-f .` reads `docker-compose.yml` too, and fails with `apiVersion not set, kind not set`.
+
+Before you apply, you can check what would happen:
+
+```sh
+kubectl apply --dry-run=client -f '*.yaml'   # check the files, change nothing
+kubectl diff -f '*.yaml'                     # show what would change in the cluster
+```
+
+`kubectl create -f x.yaml` is the **imperative** form: it only creates, and fails with `AlreadyExists` if the object is there. Use `apply` for files that you keep and change.
+
+#### kubectl get all
+
+`get all` lists the main objects in the current namespace. Measured here, after `kubectl apply`:
+
+```
+$ kubectl get all
+NAME                       READY   STATUS    RESTARTS   AGE
+pod/api-c58f86c9f-xl97n    1/1     Running   0          16m
+pod/db-6c987d97cb-6m5qt    1/1     Running   0          16m
+pod/web-7b9b9564f7-2wfjd   1/1     Running   0          16m
+
+NAME                 TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)          AGE
+service/api          NodePort       10.98.233.166   <none>        8080:30306/TCP   16m
+service/db           ClusterIP      10.111.17.215   <none>        27017/TCP        16m
+service/kubernetes   ClusterIP      10.96.0.1       <none>        443/TCP          34m
+service/web-tcp      LoadBalancer   10.109.208.85   <pending>     8081:31150/TCP   16m
+
+NAME                  READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/api   1/1     1            1           16m
+deployment.apps/db    1/1     1            1           16m
+deployment.apps/web   1/1     1            1           16m
+
+NAME                             DESIRED   CURRENT   READY   AGE
+replicaset.apps/api-c58f86c9f    1         1         1       16m
+replicaset.apps/db-6c987d97cb    1         1         1       16m
+replicaset.apps/web-7b9b9564f7   1         1         1       16m
+```
+
+How to read it:
+
+- **One Deployment makes one ReplicaSet, and the ReplicaSet makes the pods.** You can see this in the names: Deployment `api`, ReplicaSet `api-c58f86c9f`, pod `api-c58f86c9f-xl97n`. The ReplicaSet keeps the pod count right. The Deployment makes a new ReplicaSet when you change the image (a rolling update).
+- **Pod `READY 1/1`**: 1 of the 1 containers in the pod is ready. `RESTARTS` counts how often a container crashed and was started again.
+- **Deployment `READY 1/1`**: 1 of the 1 pods you asked for is ready.
+- **`service/kubernetes`** is not yours. The cluster makes it, so that pods can reach the Kubernetes API.
+
+**"all" is not everything.** It means the resource types in the `all` category: pods, Services, Deployments, ReplicaSets, StatefulSets, DaemonSets, Jobs, CronJobs, HorizontalPodAutoscalers and ReplicationControllers. It does **not** include ConfigMaps, Secrets, Ingresses, PersistentVolumeClaims or namespaces. Ask for those by name, for example `kubectl get configmaps,secrets,ingress`.
+
+Useful flags (they also work with `kubectl get pods`, `kubectl get services`, and so on):
+
+| Flag | What it does |
+| --- | --- |
+| `-o wide` | More columns, for example the pod IP and the node |
+| `-o yaml` | The full object, as YAML |
+| `-l io.kompose.service=api` | Only objects with this label |
+| `-n kube-system` | Another namespace |
+| `-A` | All namespaces |
+| `-w` | Keep watching, and print each change |
+
+#### kubectl scale --replicas=5 deployment/api
+
+`scale` changes the number of pods of a Deployment **now**. `deployment/api` is `type/name`. `kubectl scale deployment api --replicas=5` does the same.
+
+Measured here. Just after the command, the ReplicaSet makes 4 new pods:
+
+```
+$ kubectl scale --replicas=5 deployment/api
+deployment.apps/api scaled
+
+$ kubectl get pods -l io.kompose.service=api
+NAME                  READY   STATUS              RESTARTS   AGE
+api-c58f86c9f-j84c9   0/1     Pending             0          0s
+api-c58f86c9f-l8hgv   0/1     Pending             0          0s
+api-c58f86c9f-pv7tw   0/1     Pending             0          0s
+api-c58f86c9f-qt5sx   0/1     ContainerCreating   0          0s
+api-c58f86c9f-xl97n   1/1     Running             0          16m
+```
+
+Two seconds later, all 5 run, each with its own IP:
+
+```
+$ kubectl get deployment api
+NAME   READY   UP-TO-DATE   AVAILABLE   AGE
+api    5/5     5            5           16m
+
+$ kubectl get pods -l io.kompose.service=api -o wide
+NAME                  READY   STATUS    RESTARTS   AGE   IP          NODE
+api-c58f86c9f-j84c9   1/1     Running   0          2s    10.1.0.10   docker-desktop
+api-c58f86c9f-l8hgv   1/1     Running   0          2s    10.1.0.9    docker-desktop
+api-c58f86c9f-pv7tw   1/1     Running   0          2s    10.1.0.11   docker-desktop
+api-c58f86c9f-qt5sx   1/1     Running   0          2s    10.1.0.12   docker-desktop
+api-c58f86c9f-xl97n   1/1     Running   0          16m   10.1.0.8    docker-desktop
+```
+
+The `api` Service finds the new pods by their label, and sends requests to all 5:
+
+```
+$ kubectl describe service api | grep Endpoints
+Endpoints:                10.1.0.8:8080,10.1.0.10:8080,10.1.0.11:8080 + 2 more...
+```
+
+Compare this with [`docker compose up --scale`](#scaling-with-a-fixed-host-port-fails): there, 5 replicas with the fixed host port `8080` failed with `port is already allocated`. Here there is no port problem. The pods do not publish a port on your Mac; only the Service has one, and the Service spreads the requests over the pods.
+
+**The Deployment keeps the count.** Measured here: one of the 5 pods was deleted, and a new one was running 2 seconds later:
+
+```
+$ kubectl delete pod api-c58f86c9f-j84c9
+$ kubectl get pods -l io.kompose.service=api
+NAME                  READY   STATUS        RESTARTS   AGE
+api-c58f86c9f-8s6x9   1/1     Running       0          2s     ← new
+api-c58f86c9f-j84c9   1/1     Terminating   0          5s     ← deleted
+...
+```
+
+**`scale` does not change the file.** `api-deployment.yaml` still says `replicas: 1`. The next `kubectl apply` puts it back to 1. Measured here:
+
+```
+$ kubectl apply -f api-deployment.yaml
+deployment.apps/api configured          ← not "unchanged": replicas went from 5 to 1
+```
+
+So use `scale` for a quick test. To keep a new count, change `replicas:` in the YAML file and apply it.
+
+Scale the **stateless** `api` and `web`, not `db`. With 3 `db` pods you get 3 separate MongoDB databases, each with its own count. It is the same rule as [Do not scale the database](#do-not-scale-the-database).
+
+`kubectl scale --replicas=0 deployment/api` stops all `api` pods, but keeps the Deployment, so you can scale up again later.
+
+#### kubectl delete all --all
+
+This deletes **every object in the `all` category, in the current namespace**:
+
+- `all`: the resource types from [kubectl get all](#kubectl-get-all): pods, Services, Deployments, ReplicaSets, ...
+- `--all`: every object of those types, not one by name
+
+For the Kompose project, that means all three Deployments, their ReplicaSets and pods, and the `api`, `db` and `web-tcp` Services. The output looks like this:
+
+```
+$ kubectl delete all --all
+pod "api-c58f86c9f-xl97n" deleted
+pod "db-6c987d97cb-6m5qt" deleted
+pod "web-7b9b9564f7-2wfjd" deleted
+service "api" deleted
+service "db" deleted
+service "kubernetes" deleted
+service "web-tcp" deleted
+deployment.apps "api" deleted
+...
+```
+
+Things to know:
+
+- **It cannot be undone, and it does not ask first.** The MongoDB data is lost too, because `db` has no volume. To get the app back, run `kubectl apply -f '*.yaml'` again.
+- **It uses the current context.** If kubectl points at a shared or production cluster, it deletes that. Always check `kubectl config current-context` first.
+- **Only the current namespace.** Add `-n other` for another one. Other namespaces, such as `kube-system`, are not touched.
+- **It also deletes `service/kubernetes`.** That is not a problem: the cluster makes it again.
+- **"all" is not everything**, the same as for `get all`. ConfigMaps, Secrets, Ingresses and PersistentVolumeClaims stay.
+
+To delete only the pods is not enough: the Deployment makes new ones at once (see above). You must delete the **Deployment**.
+
+Safer ways to delete only this project:
+
+```sh
+kubectl delete -f '*.yaml'                       # only what the files describe
+kubectl delete all -l io.kompose.service=api     # only the objects with this label
+kubectl delete deployment/api service/api        # by type/name
+```
+
 ### Problems and fixes (Kubernetes)
 
 | What you see | Why | Fix |
 | --- | --- | --- |
+| `web-tcp` has `EXTERNAL-IP <pending>` on Docker Desktop, and `localhost:8081` shows a different app | Another program uses port 8081. Measured here: the App 9 Compose project (`docker-compose-web-1`, ports 8080 and 8081) was still running. | `docker compose down` in `docker-compose/`, or use `kubectl port-forward`. |
+| `web-tcp` has `EXTERNAL-IP <pending>` on minikube | minikube has no load balancer. | `minikube tunnel` in a second terminal, or `minikube service web-tcp`. |
+| Pod status `ErrImagePull` or `ImagePullBackOff` for `api` or `web` | No `imagePullPolicy: Never`, so Kubernetes tries to download a local image from Docker Hub. | Add `kompose.image-pull-policy: Never` and convert again. |
+| Pod status `ErrImageNeverPull` | The policy is `Never`, but the node does not have the image. On minikube, the image is in your Mac's Docker, not minikube's. | `kompose convert --build local` (Docker Desktop), or `minikube image load api web`. |
+| `provided port is not in the valid range. The range of valid ports is 30000-32767` | `kompose.service.nodeport.port` is outside the NodePort range. | Use a port from 30000 to 32767, or remove the label. |
+| `Service "db" won't be created because 'ports' is not specified` | The Compose service has no `ports:`. Without a Service, `db` has no DNS name. | Add `ports: - "27017:27017"` to `db`. |
+| `kubectl apply -f .` fails: `error validating "docker-compose.yml"` | `-f .` reads every YAML file in the folder, and the Compose file is not a Kubernetes file. | `kubectl apply -f '*.yaml'`, or let Kompose write to a folder: `kompose convert --build local -o k8s/`. |
+| `zsh: no matches found: *.yaml` | Without quotes, zsh tries to expand the pattern itself. | Put quotes around it: `-f '*.yaml'`. |
+| After `kubectl scale`, the count goes back to 1 | `kubectl apply` used the `replicas: 1` from the file. | Change `replicas:` in the YAML file, then apply. |
+| You deleted the pods, but new ones start at once | The Deployment keeps the count you asked for. | Delete the Deployment, or `kubectl scale --replicas=0`. |
+| The page loads, but the count does not change (404 on `/api`) | The `web` image has no `nginx.conf` proxy, or the API routes are not under `/api`. | Use the `kubernetes/web` and `kubernetes/api` code, then build and apply again. |
 | `kubectl config get-contexts` shows no contexts | No local cluster is set up yet. | Turn on Kubernetes in Docker Desktop, or run `minikube start`. |
 | `The connection to the server localhost:8080 was refused` | kubectl has no current context, so it tries a default address. | Turn on a cluster, then `kubectl config use docker-desktop` (or `minikube`). |
 | `kubectl get nodes` cannot connect to `minikube` | The minikube cluster is stopped, for example after a restart of your computer. | `minikube start` |
