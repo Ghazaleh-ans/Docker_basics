@@ -15,3 +15,4 @@ npm-debug.log*
 .vscode/
 .idea/
 docker-compose/web/dist/
+kubernetes/web/dist/
