@@ -124,6 +124,14 @@
     - [Limits of --scale](#limits-of---scale)
     - [Problems and fixes](#problems-and-fixes-1)
     - [When to use Compose and --scale](#when-to-use-compose-and---scale)
+13. [Kubernetes](#kubernetes)
+    - [Why Kubernetes after Compose?](#why-kubernetes-after-compose)
+    - [Main ideas](#main-ideas)
+    - [Before you start: Windows](#before-you-start-windows)
+    - [kubectl: the Kubernetes CLI](#kubectl-the-kubernetes-cli)
+    - [A local cluster: Docker Desktop or minikube](#a-local-cluster-docker-desktop-or-minikube)
+    - [Contexts: switch between clusters](#contexts-switch-between-clusters)
+    - [Problems and fixes (Kubernetes)](#problems-and-fixes-kubernetes)
 
 ---
 
@@ -3385,3 +3393,215 @@ Do not use `--scale` for:
 - databases and other services that keep their data in the container
 - services with a fixed host port, until you change `ports:`
 - production with several machines or autoscaling: use Kubernetes, Docker Swarm or a cloud service
+
+---
+
+## Kubernetes
+
+**Kubernetes** is a long word, so people often write **k8s**: a `k`, then the 8 letters `ubernete`, then an `s`.
+
+Containers alone are useful for many things: production apps, machine learning, developer environments, and quick tests. Kubernetes is built **on** containers, so you must know containers before you use Kubernetes. Everything in the Docker sections above still applies.
+
+Kubernetes is a **container orchestration** tool. It manages large groups of containers (a **cluster**) that run on **many different machines**. It is a complex tool for complex problems. This section explains the main ideas and how to start a cluster on your computer. After that, explore more on your own.
+
+### Why Kubernetes after Compose?
+
+[Limits of --scale](#limits-of---scale) lists what Docker Compose cannot do. Kubernetes does these things:
+
+| Compose and `--scale` | Kubernetes |
+| --- | --- |
+| One machine only | Many machines (nodes) in one cluster |
+| The replica count stays the same until you change it | Can add and remove replicas when the load changes (autoscaling) |
+| DNS round-robin, no real load balancer | A Service gives one stable address and spreads requests over the pods |
+| If a container stops, it stays stopped (unless you set `restart:`) | If a pod stops, Kubernetes starts a new one to get back to the count you asked for |
+| `up -d --build` replaces the containers | Rolling updates: new pods start before the old ones stop |
+
+For a small project on one machine, Compose is usually enough. Use Kubernetes when you need the right column.
+
+### Main ideas
+
+```
+ ┌─────────────────────────────── Cluster ───────────────────────────────┐
+ │                                                                       │
+ │   Control plane  (the brain: decides what runs where)                 │
+ │        │                                                              │
+ │        ├──────────────────────────┬───────────────────────────┐       │
+ │        ▼                          ▼                           ▼       │
+ │   ┌─ Node 1 ─────────────┐   ┌─ Node 2 ─────────────┐   ┌─ Node 3 ─┐  │
+ │   │ [pod: api] [pod: api]│   │ [pod: api] [pod: db] │   │   ...    │  │
+ │   └──────────────────────┘   └──────────────────────┘   └──────────┘  │
+ │                                                                       │
+ │   Service "api"  ──▶  one stable address for all the "api" pods       │
+ └───────────────────────────────────────────────────────────────────────┘
+```
+
+| Word | Meaning |
+| --- | --- |
+| **Control plane** | The server that coordinates everything else. The brain of the cluster. |
+| **Node** | A worker machine that runs your containers. |
+| **Pod** | The smallest thing Kubernetes deploys: one or more containers that always go together. |
+| **Service** | One stable address for a group of pods. |
+| **Deployment** | A description of the pods you want. Kubernetes changes the cluster until it matches. |
+
+#### Control plane
+
+The control plane is the server that coordinates the cluster. It decides which node runs which pod, watches the pods, and replaces them when they fail. Some cloud providers do not charge you to run the control plane.
+
+Older documents call it the **master node**. That name is no longer used.
+
+#### Nodes
+
+A node (not Node.js) is a **worker** machine that runs your containers. One node can run one container or many:
+
+- **Machine learning:** you need big, powerful servers for training, so one node may run only one container.
+- **A Node.js server** like the apps in this repository: one node runs many containers.
+
+A node is only a place to deploy to. It can be a physical server, a VM, or even a container. For Kubernetes, the difference is not important. Think of a node as a destination for containers.
+
+#### Pods
+
+A pod is like an atom of the cluster: you cannot divide it, so Kubernetes always deploys it as one unit.
+
+If several containers work together as one unit, and do not work without each other, put them in **one** pod. Kubernetes then always runs them together, on the same node.
+
+Most of the time, a pod has **one** container. For example, with the [App 9](#app-9-docker-compose) API and MongoDB:
+
+- the API in one pod, MongoDB in a different pod
+- they can scale **separately**: 5 API pods, 1 MongoDB pod
+
+This is the same rule as [Do not scale the database](#do-not-scale-the-database): scale the stateless API, not the database.
+
+#### Services
+
+Pods start and stop all the time, when Kubernetes scales them up and down or replaces a broken one. Each new pod gets a **new IP address**. So you cannot tell one part of your app to use a pod's IP address: that pod, and its address, can go away at any time.
+
+A **Service** fixes this. It is one **stable** address in front of a group of pods. The User service talks to the Admin Service's address, and Kubernetes sends each request to one of the Admin pods that run at that time, however many there are.
+
+- A Service is often one backend, or one microservice.
+- A Service can also be a database, a cache, or a group of machine learning pods.
+- Like one container in one pod, you can have one pod in one Service. So a small app can be one container, in one pod, behind one Service.
+
+**Watch out:** a Compose "service" and a Kubernetes "Service" are not the same. In Compose, a service is the description of a container (`api`, `db`, `web`). In Kubernetes, a Service is only the stable network address in front of pods. The pods themselves come from a Deployment.
+
+#### Deployments
+
+In a deployment, you **describe the state you want**: for example, "3 pods from the image `my-api:1.0`". You do not give the steps. Kubernetes compares this with what runs now, and works to get the cluster into that state:
+
+- a pod stops: Kubernetes starts a new one
+- you change the count from 3 to 5: Kubernetes starts 2 more
+- you change the image to `my-api:1.1`: Kubernetes replaces the pods, a few at a time
+
+This is like [`deploy.replicas`](#scale-down-and-deployreplicas) in Compose, but Kubernetes **keeps checking** it.
+
+| Kubernetes | Nearest thing in this repository |
+| --- | --- |
+| Pod | One container from `docker run` |
+| Deployment | A Compose service with `deploy.replicas` |
+| Service | The service name in Docker's DNS ([How replicas share work](#how-replicas-share-work-dns)), but a real load balancer |
+| Node | Your Docker host (your Mac) |
+| Cluster | All of the above, on many machines |
+
+### Before you start: Windows
+
+Kubernetes is difficult to set up in the Windows Subsystem for Linux (WSL). On Windows:
+
+- use **PowerShell**, which works well, or
+- connect to a real Linux VM, or
+- only read this section: you do not have to run the commands to understand the ideas.
+
+macOS and Linux work well.
+
+### kubectl: the Kubernetes CLI
+
+You need one new command-line tool: **kubectl**. It controls **any** Kubernetes cluster, local or in the cloud. It is the one CLI for all of Kubernetes. Many people say it as "cube cuddle"; others say "cube control" or "cube C T L".
+
+Docker Desktop installs kubectl for you. Measured here:
+
+```
+$ ls -l /usr/local/bin/kubectl
+/usr/local/bin/kubectl -> /Applications/Docker.app/Contents/Resources/bin/kubectl
+
+$ kubectl version --client
+Client Version: version.Info{Major:"1", Minor:"25", GitVersion:"v1.25.4", ...}
+```
+
+Without Docker Desktop, see [Install Tools](https://kubernetes.io/docs/tasks/tools/) in the Kubernetes documentation, or on macOS use `brew install kubectl`.
+
+### A local cluster: Docker Desktop or minikube
+
+kubectl needs a cluster to talk to. On your computer, you have two choices:
+
+| | Docker Desktop Kubernetes | minikube |
+| --- | --- | --- |
+| Install | Already in Docker Desktop; turn it on in Settings | A separate tool |
+| Easy to use | Yes, easier | A little more work |
+| Features | Simple; good to learn on, but has some limits | More features, for more complex things |
+| Used for | Learning, local development | Local development only |
+
+If you have no preference, use **Docker Desktop**, because it is easier. Get minikube when you need more.
+
+#### Turn on Kubernetes in Docker Desktop
+
+1. Open Docker Desktop **Settings** (in older versions: **Preferences**).
+2. Open the **Kubernetes** tab.
+3. Select **Enable Kubernetes**.
+4. Click **Apply & restart**, and accept when Docker Desktop asks to restart.
+5. Wait a few minutes, until Docker Desktop shows that Kubernetes is running.
+
+#### Or use minikube
+
+minikube is a development tool that runs a Kubernetes cluster on your computer. You only ever use it locally. See [minikube start](https://minikube.sigs.k8s.io/docs/start/) to install it, or on macOS:
+
+```sh
+brew install minikube
+```
+
+Then start the cluster. Do this each time before you use it:
+
+```sh
+minikube start
+```
+
+### Contexts: switch between clusters
+
+You can have **both** Docker Desktop Kubernetes and minikube. Each cluster that kubectl knows is a **context**. kubectl sends every command to the **current** context.
+
+```sh
+# List all contexts. A * marks the current one.
+kubectl config get-contexts
+
+# Show only the current context
+kubectl config current-context
+
+# Switch to minikube or to Docker Desktop
+kubectl config use-context minikube
+kubectl config use-context docker-desktop
+
+# use is a short alias for use-context
+kubectl config use docker-desktop
+```
+
+Measured here, before Kubernetes was turned on in Docker Desktop, the list was empty:
+
+```
+$ kubectl config get-contexts
+CURRENT   NAME   CLUSTER   AUTHINFO   NAMESPACE
+```
+
+When the cluster runs, check that kubectl can reach it:
+
+```sh
+kubectl get nodes
+```
+
+You see one node, named `docker-desktop` or `minikube`, with the status `Ready`. A local cluster has one node that is the control plane and the worker at the same time.
+
+### Problems and fixes (Kubernetes)
+
+| What you see | Why | Fix |
+| --- | --- | --- |
+| `kubectl config get-contexts` shows no contexts | No local cluster is set up yet. | Turn on Kubernetes in Docker Desktop, or run `minikube start`. |
+| `The connection to the server localhost:8080 was refused` | kubectl has no current context, so it tries a default address. | Turn on a cluster, then `kubectl config use docker-desktop` (or `minikube`). |
+| `kubectl get nodes` cannot connect to `minikube` | The minikube cluster is stopped, for example after a restart of your computer. | `minikube start` |
+| Commands change the wrong cluster | The current context is not the one you think. | `kubectl config current-context`, then `kubectl config use ...` |
+| `error: no context exists with the name: "minikube"` | minikube is not installed or was never started. | Install minikube, then `minikube start`. |
